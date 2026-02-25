@@ -1,5 +1,6 @@
 const DEFAULT_GRACE_MS = 2 * 60 * 60 * 1000;
 const UNSCHEDULED_GRACE_MS = 10 * 60 * 1000;
+const BOOTSTRAP_GRACE_MS = 20 * 1000;
 
 export default {
   async fetch(request, env) {
@@ -98,12 +99,15 @@ function getClientInfo(request) {
   };
 }
 
-function isSameClient(data, sessionId, request) {
+function isSameClient(data, sessionId, request, allowBootstrap = false) {
   if (data.used_session_id && sessionId) return data.used_session_id === sessionId;
   if (!data.used_session_id) return false;
   const info = getClientInfo(request);
   if (data.used_ip && info.ip && data.used_ip !== info.ip) return false;
   if (data.used_ua && info.ua && data.used_ua !== info.ua) return false;
+  if (allowBootstrap && data.used_at_ms && Date.now() - data.used_at_ms <= BOOTSTRAP_GRACE_MS) {
+    return true;
+  }
   return Boolean(data.used_ip || data.used_ua);
 }
 
@@ -314,7 +318,7 @@ async function handleTokenVerify(request, env) {
   }
 
   if (data.mode === "proxy" && data.used_at_ms) {
-    if (!isSameClient(data, sessionId, request)) {
+    if (!isSameClient(data, sessionId, request, true)) {
       return json({ error: "Token already used" }, 409);
     }
     if (now > data.used_at_ms + DEFAULT_GRACE_MS) {
@@ -365,11 +369,16 @@ async function handleProxy(request, env, token, restPath, search) {
   }
 
   if (data.used_at_ms) {
-    if (!isSameClient(data, existingSessionId, request)) {
+    const sameClient = isSameClient(data, existingSessionId, request, true);
+    if (!sameClient) {
       return new Response("Token already used", { status: 409, headers: corsHeaders() });
     }
     if (now > data.used_at_ms + DEFAULT_GRACE_MS) {
       return new Response("Token expired", { status: 410, headers: corsHeaders() });
+    }
+    if (!existingSessionId && shouldSetSession) {
+      data.used_session_id = activeSessionId;
+      await saveTokenData(env, token, data);
     }
   } else {
     const info = getClientInfo(request);
