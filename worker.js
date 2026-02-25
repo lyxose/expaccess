@@ -155,7 +155,7 @@ function buildWaitingPage(token, data, deviceOk) {
     : `/proxy/${token}/`;
   const policyNote = isUnscheduled
     ? "请在 10 分钟内进入实验，仅能启动一次，确认准备好后再进入。"
-    : "实验开始后请勿刷新页面。";
+    : "仅能启动一次，请勿刷新页面。";
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
