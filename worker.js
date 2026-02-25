@@ -1,4 +1,5 @@
 const DEFAULT_GRACE_MS = 2 * 60 * 60 * 1000;
+const UNSCHEDULED_GRACE_MS = 10 * 60 * 1000;
 
 export default {
   async fetch(request, env) {
@@ -63,8 +64,52 @@ async function getTokenData(env, token) {
 
 async function saveTokenData(env, token, data) {
   if (!env.ACCESS_KV) return;
-  const ttlSeconds = Math.max(60, Math.floor((data.expires_at_ms - Date.now()) / 1000));
+  const expiresAt = Number(data.expires_at_ms || data.grace_expires_at_ms || (Date.now() + DEFAULT_GRACE_MS));
+  const ttlSeconds = Math.max(60, Math.floor((expiresAt - Date.now()) / 1000));
   await env.ACCESS_KV.put(`access:${token}`, JSON.stringify(data), { expirationTtl: ttlSeconds });
+}
+
+function parseCookies(header) {
+  if (!header) return {};
+  return header.split(";").reduce((acc, part) => {
+    const [key, ...rest] = part.trim().split("=");
+    if (!key) return acc;
+    acc[key] = decodeURIComponent(rest.join("="));
+    return acc;
+  }, {});
+}
+
+function getSessionId(request) {
+  const cookies = parseCookies(request.headers.get("cookie"));
+  return cookies.access_session || "";
+}
+
+function createSessionId() {
+  if (crypto?.randomUUID) return crypto.randomUUID();
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function getClientInfo(request) {
+  return {
+    ip: request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "",
+    ua: request.headers.get("user-agent") || "",
+  };
+}
+
+function isSameClient(data, sessionId, request) {
+  if (data.used_session_id && sessionId) return data.used_session_id === sessionId;
+  if (!data.used_session_id) return false;
+  const info = getClientInfo(request);
+  if (data.used_ip && info.ip && data.used_ip !== info.ip) return false;
+  if (data.used_ua && info.ua && data.used_ua !== info.ua) return false;
+  return Boolean(data.used_ip || data.used_ua);
+}
+
+function getBaseDir(pathname) {
+  if (!pathname || pathname === "/") return "/";
+  return pathname.endsWith("/") ? pathname : pathname.replace(/\/[^/]*$/, "/");
 }
 
 function detectDeviceType(userAgent) {
@@ -92,11 +137,13 @@ function appendTokenToUrl(targetUrl, token) {
 
 function buildWaitingPage(token, data, deviceOk) {
   const startMs = data.start_at_ms || Date.now();
+  const isUnscheduled = data.access_policy === "unscheduled";
+  const graceUntilMs = data.grace_expires_at_ms || (Date.now() + UNSCHEDULED_GRACE_MS);
   const targetUrl = data.mode === "token"
     ? appendTokenToUrl(data.target_url, token)
     : `/proxy/${token}/`;
-  const policyNote = data.access_policy === "unscheduled"
-    ? "请在 10 分钟内进入实验，实验开始后不要刷新页面。"
+  const policyNote = isUnscheduled
+    ? "请在 10 分钟内进入实验，仅能启动一次，确认准备好后再进入。"
     : "实验开始后请勿刷新页面。";
   return `<!DOCTYPE html>
 <html lang="zh">
@@ -110,6 +157,8 @@ function buildWaitingPage(token, data, deviceOk) {
     .hint { color: #6b7280; font-size: 0.95rem; }
     .timer { font-size: 2rem; font-weight: 700; margin: 1rem 0; }
     .warn { color: #b42318; }
+    .primary { border: none; padding: 0.75rem 1.6rem; border-radius: 12px; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; }
+    .primary[disabled] { opacity: 0.6; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -117,14 +166,18 @@ function buildWaitingPage(token, data, deviceOk) {
     <h2>实验即将开始</h2>
     <p class="hint">${policyNote}</p>
     <div class="timer" id="timer">--:--</div>
+    <button class="primary" id="startBtn" style="display:${isUnscheduled ? "inline-block" : "none"}">我已准备好，进入实验</button>
     <p class="hint" id="status"></p>
   </div>
   <script>
     const startMs = ${Number(startMs)};
+    const isUnscheduled = ${isUnscheduled ? "true" : "false"};
+    const graceUntilMs = ${Number(graceUntilMs)};
     const deviceOk = ${deviceOk ? "true" : "false"};
     const targetUrl = ${JSON.stringify(targetUrl)};
     const statusEl = document.getElementById("status");
     const timerEl = document.getElementById("timer");
+    const startBtn = document.getElementById("startBtn");
 
     if (!deviceOk) {
       statusEl.textContent = "当前设备不符合要求，请使用允许的设备打开链接。";
@@ -140,6 +193,19 @@ function buildWaitingPage(token, data, deviceOk) {
 
     function tick() {
       const now = Date.now();
+      if (isUnscheduled) {
+        const remaining = graceUntilMs - now;
+        timerEl.textContent = format(remaining);
+        if (remaining <= 0) {
+          statusEl.textContent = "已超过可进入时间，请联系主试重新获取链接。";
+          statusEl.classList.add("warn");
+          if (startBtn) {
+            startBtn.disabled = true;
+            startBtn.textContent = "链接已过期";
+          }
+        }
+        return;
+      }
       const remaining = startMs - now;
       timerEl.textContent = format(remaining);
       if (remaining <= 0 && deviceOk) {
@@ -148,24 +214,34 @@ function buildWaitingPage(token, data, deviceOk) {
       }
     }
 
-    function verifySoon() {
-      const now = Date.now();
-      const delay = Math.max(0, startMs - now - 2000);
-      setTimeout(async () => {
+    if (startBtn) {
+      startBtn.addEventListener("click", async () => {
+        if (!deviceOk) return;
+        if (Date.now() > graceUntilMs) {
+          statusEl.textContent = "已超过可进入时间，请联系主试重新获取链接。";
+          statusEl.classList.add("warn");
+          return;
+        }
+        statusEl.textContent = "正在验证...";
         try {
-          await fetch("/token/verify", {
+          const resp = await fetch("/token/verify", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ token: ${JSON.stringify(token)} }),
           });
+          if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            statusEl.textContent = data.error || "访问令牌无效";
+            statusEl.classList.add("warn");
+            return;
+          }
+          statusEl.textContent = "正在进入实验...";
+          location.href = targetUrl;
         } catch {
-          // ignore
+          statusEl.textContent = "验证失败，请检查网络后重试。";
+          statusEl.classList.add("warn");
         }
-      }, delay);
-    }
-
-    if (deviceOk) {
-      verifySoon();
+      });
     }
     tick();
     setInterval(tick, 500);
@@ -183,6 +259,12 @@ async function handleAccessPage(request, env, token) {
   if (data.expires_at_ms && now > data.expires_at_ms) {
     return new Response("Token expired", { status: 410, headers: corsHeaders() });
   }
+  if (data.access_policy === "unscheduled") {
+    if (!data.grace_expires_at_ms || now > data.grace_expires_at_ms) {
+      data.grace_expires_at_ms = now + UNSCHEDULED_GRACE_MS;
+      await saveTokenData(env, token, data);
+    }
+  }
 
   const deviceType = detectDeviceType(request.headers.get("user-agent"));
   const deviceOk = isDeviceAllowed(deviceType, data.allowed_devices);
@@ -195,7 +277,7 @@ async function handleAccessPage(request, env, token) {
 }
 
 async function handleTokenVerify(request, env) {
-  const payload = await request.json();
+  const payload = await request.json().catch(() => ({}));
   const token = payload?.token;
   if (!token) return json({ error: "Missing token" }, 400);
 
@@ -206,6 +288,9 @@ async function handleTokenVerify(request, env) {
   if (data.expires_at_ms && now > data.expires_at_ms) {
     return json({ error: "Token expired" }, 410);
   }
+  if (data.access_policy === "unscheduled" && data.grace_expires_at_ms && now > data.grace_expires_at_ms) {
+    return json({ error: "Grace period expired" }, 410);
+  }
 
   const deviceType = detectDeviceType(request.headers.get("user-agent"));
   if (!isDeviceAllowed(deviceType, data.allowed_devices)) {
@@ -213,13 +298,28 @@ async function handleTokenVerify(request, env) {
   }
 
   const startMs = data.start_at_ms || now;
-  if (now < startMs - 2000) {
+  if (data.access_policy !== "unscheduled" && now < startMs - 2000) {
     return json({ error: "Too early", start_at_ms: startMs }, 409);
   }
+  const sessionId = getSessionId(request);
 
-  if (!data.used_at) {
+  if (data.mode === "token") {
+    if (data.used_at_ms) {
+      return json({ error: "Token already used" }, 409);
+    }
+    data.used_at_ms = now;
     data.used_at = new Date().toISOString();
     await saveTokenData(env, token, data);
+    return json({ ok: true, start_at_ms: startMs });
+  }
+
+  if (data.mode === "proxy" && data.used_at_ms) {
+    if (!isSameClient(data, sessionId, request)) {
+      return json({ error: "Token already used" }, 409);
+    }
+    if (now > data.used_at_ms + DEFAULT_GRACE_MS) {
+      return json({ error: "Token expired" }, 410);
+    }
   }
 
   return json({ ok: true, start_at_ms: startMs });
@@ -242,6 +342,9 @@ async function handleProxy(request, env, token, restPath, search) {
   if (data.expires_at_ms && now > data.expires_at_ms) {
     return new Response("Token expired", { status: 410, headers: corsHeaders() });
   }
+  if (data.access_policy === "unscheduled" && data.grace_expires_at_ms && now > data.grace_expires_at_ms) {
+    return new Response("Grace period expired", { status: 410, headers: corsHeaders() });
+  }
 
   const deviceType = detectDeviceType(request.headers.get("user-agent"));
   if (!isDeviceAllowed(deviceType, data.allowed_devices)) {
@@ -249,18 +352,42 @@ async function handleProxy(request, env, token, restPath, search) {
   }
 
   const startMs = data.start_at_ms || now;
-  if (now < startMs) {
+  if (data.access_policy !== "unscheduled" && now < startMs) {
     return new Response("Not started", { status: 409, headers: corsHeaders() });
   }
 
-  if (!data.used_at) {
+  const existingSessionId = getSessionId(request);
+  let activeSessionId = existingSessionId;
+  let shouldSetSession = false;
+  if (!activeSessionId) {
+    activeSessionId = createSessionId();
+    shouldSetSession = true;
+  }
+
+  if (data.used_at_ms) {
+    if (!isSameClient(data, existingSessionId, request)) {
+      return new Response("Token already used", { status: 409, headers: corsHeaders() });
+    }
+    if (now > data.used_at_ms + DEFAULT_GRACE_MS) {
+      return new Response("Token expired", { status: 410, headers: corsHeaders() });
+    }
+  } else {
+    const info = getClientInfo(request);
+    data.used_at_ms = now;
     data.used_at = new Date().toISOString();
+    data.used_session_id = activeSessionId;
+    data.used_ip = info.ip;
+    data.used_ua = info.ua;
     await saveTokenData(env, token, data);
   }
 
   const targetBase = new URL(data.target_url);
   const targetPath = restPath ? `/${restPath}` : targetBase.pathname;
   const targetUrl = new URL(targetPath + (search || ""), targetBase.origin);
+  const baseDir = getBaseDir(targetBase.pathname);
+  const proxyOrigin = new URL(request.url).origin;
+  const proxyBase = `${proxyOrigin}/proxy/${token}`;
+  const proxyDirBase = `${proxyBase}${baseDir}`;
 
   const init = {
     method: request.method,
@@ -273,13 +400,26 @@ async function handleProxy(request, env, token, restPath, search) {
   const contentType = resp.headers.get("content-type") || "";
   const headers = new Headers(resp.headers);
   headers.set("access-control-allow-origin", "*");
+  if (shouldSetSession) {
+    const isSecure = new URL(request.url).protocol === "https:";
+    const maxAge = Math.max(60, Math.floor(DEFAULT_GRACE_MS / 1000));
+    headers.append(
+      "set-cookie",
+      `access_session=${encodeURIComponent(activeSessionId)}; Path=/proxy/${token}/; Max-Age=${maxAge}; SameSite=Lax${isSecure ? "; Secure" : ""}`
+    );
+  }
 
   if (contentType.includes("text/html")) {
     let text = await resp.text();
-    const proxyBase = `${new URL(request.url).origin}/proxy/${token}`;
+    if (!/\<base\s/i.test(text)) {
+      text = text.replace(/<head(\b[^>]*)>/i, `<head$1><base href="${proxyDirBase}">`);
+    }
     text = text
-      .replace(/(href|src|action)=(['"])\//g, (match, attr, quote) => `${attr}=${quote}${proxyBase}/`)
-      .replace(/(href|src|action)=(['"])(?!https?:|\/)/g, (match, attr, quote) => `${attr}=${quote}${proxyBase}/`);
+      .replace(/(href|src|action)=(['"])\/(?!\/)([^'">]*)/g, (match, attr, quote, path) => `${attr}=${quote}${proxyBase}/${path}`)
+      .replace(
+        /(href|src|action)=(['"])(?!https?:|\/|#|data:|mailto:|tel:|javascript:)([^'">]+)/g,
+        (match, attr, quote, path) => `${attr}=${quote}${proxyDirBase}${path}`
+      );
     return new Response(text, { status: resp.status, headers });
   }
 
