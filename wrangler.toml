@@ -1,0 +1,8 @@
+name = "exp_access"
+main = "worker.js"
+compatibility_date = "2026-02-15"
+
+[[kv_namespaces]]
+binding = "ACCESS_KV"
+id = "cef47031bb6f48e1b1d7aab33370dfdc"
+# preview_id = "<PASTE_ACCESS_KV_PREVIEW_ID>"
