@@ -111,6 +111,13 @@ function isSameClient(data, sessionId, request, allowBootstrap = false) {
   return Boolean(data.used_ip || data.used_ua);
 }
 
+function isDocumentRequest(request) {
+  const dest = (request.headers.get("sec-fetch-dest") || "").toLowerCase();
+  if (dest) return dest === "document";
+  const accept = (request.headers.get("accept") || "").toLowerCase();
+  return accept.includes("text/html");
+}
+
 function getBaseDir(pathname) {
   if (!pathname || pathname === "/") return "/";
   return pathname.endsWith("/") ? pathname : pathname.replace(/\/[^/]*$/, "/");
@@ -368,9 +375,10 @@ async function handleProxy(request, env, token, restPath, search) {
     shouldSetSession = true;
   }
 
+  const docRequest = isDocumentRequest(request);
   if (data.used_at_ms) {
     const sameClient = isSameClient(data, existingSessionId, request, true);
-    if (!sameClient) {
+    if (!sameClient && docRequest) {
       return new Response("Token already used", { status: 409, headers: corsHeaders() });
     }
     if (now > data.used_at_ms + DEFAULT_GRACE_MS) {
