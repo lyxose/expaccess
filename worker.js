@@ -278,8 +278,8 @@ async function handleProxy(request, env, token, restPath, search) {
     let text = await resp.text();
     const proxyBase = `${new URL(request.url).origin}/proxy/${token}`;
     text = text
-      .replace(/(href|src|action)=(["'])\/(g, `$1=$2${proxyBase}/`)
-      .replace(/(href|src|action)=(["'])(?!https?:|\/)/g, `$1=$2${proxyBase}/`);
+      .replace(/(href|src|action)=(['"])\//g, (match, attr, quote) => `${attr}=${quote}${proxyBase}/`)
+      .replace(/(href|src|action)=(['"])(?!https?:|\/)/g, (match, attr, quote) => `${attr}=${quote}${proxyBase}/`);
     return new Response(text, { status: resp.status, headers });
   }
 
