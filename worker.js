@@ -287,6 +287,42 @@ async function handleHostedAsset(request, env, url) {
 
   const accessToken = url.searchParams.get("access_token") || "";
   const tokenData = accessToken ? await getTokenData(env, accessToken) : null;
+  if (accessToken && !tokenData) {
+    return new Response("Token not found", { status: 404 });
+  }
+  if (tokenData && tokenData.mode === "proxy") {
+    return new Response("Invalid mode", { status: 400 });
+  }
+
+  if (tokenData && tokenData.mode === "token") {
+    const now = Date.now();
+    if (tokenData.expires_at_ms && now > tokenData.expires_at_ms) {
+      return new Response("Token expired", { status: 410 });
+    }
+    if (tokenData.access_policy === "unscheduled" && tokenData.grace_expires_at_ms && now > tokenData.grace_expires_at_ms) {
+      return new Response("Grace period expired", { status: 410 });
+    }
+    const deviceType = detectDeviceType(request.headers.get("user-agent"));
+    if (!isDeviceAllowed(deviceType, tokenData.allowed_devices)) {
+      return new Response("Device not allowed", { status: 403 });
+    }
+    const startMs = tokenData.start_at_ms || now;
+    if (tokenData.access_policy !== "unscheduled" && now < startMs - 2000) {
+      return new Response("Too early", { status: 409 });
+    }
+    const docRequest = isDocumentRequest(request);
+    if (tokenData.used_at_ms && docRequest) {
+      return new Response("Token already used", { status: 409 });
+    }
+    if (!tokenData.used_at_ms && docRequest) {
+      tokenData.used_at_ms = now;
+      tokenData.used_at = new Date().toISOString();
+      await saveTokenData(env, accessToken, tokenData);
+    }
+    if (tokenData.used_at_ms && now > tokenData.used_at_ms + DEFAULT_GRACE_MS) {
+      return new Response("Token expired", { status: 410 });
+    }
+  }
   const accessConfig = tokenData?.access_config || {};
   const allowDownload = accessConfig.allow_download !== false;
   const downloadPolicy = accessConfig.download_policy || "upload_only";
@@ -376,6 +412,30 @@ function buildCaptureScript() {
     }
   };
 
+  const hookPsychoSave = () => {
+    if (window.__EXP_SAVE_HOOKED__) return true;
+    const psycho = window.psychoJS || window.psychojs || window.PsychoJS;
+    const exp = psycho?.experiment || psycho?._experiment;
+    if (!exp || typeof exp.save !== "function") return false;
+    const original = exp.save.bind(exp);
+    exp.save = async function (...args) {
+      let result;
+      try {
+        result = await original(...args);
+      } finally {
+        try {
+          const data = exp._trialsData || exp._trialList || exp._data || null;
+          if (data) post({ type: "psychojs_save", data });
+        } catch {
+          // ignore
+        }
+      }
+      return result;
+    };
+    window.__EXP_SAVE_HOOKED__ = true;
+    return true;
+  };
+
   const blockDownload = () => {
     if (allowDownload) return;
     if (typeof window.saveAs === "function") {
@@ -392,6 +452,12 @@ function buildCaptureScript() {
     if (document.visibilityState === "hidden") extractPsychoData();
   });
   window.addEventListener("beforeunload", extractPsychoData);
+
+  const hookTimer = setInterval(() => {
+    if (hookPsychoSave()) {
+      clearInterval(hookTimer);
+    }
+  }, 500);
 
   setTimeout(blockDownload, 500);
 })();`;
