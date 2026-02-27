@@ -21,6 +21,14 @@ export default {
       return handleProxy(request, env, token, rest, url.search);
     }
 
+    if (url.pathname.startsWith("/exp/")) {
+      return handleHostedAsset(request, env, url);
+    }
+
+    if (url.pathname === "/data/collect" && request.method === "POST") {
+      return handleDataCollect(request, env);
+    }
+
     if (url.pathname === "/token/verify" && request.method === "POST") {
       return handleTokenVerify(request, env);
     }
@@ -259,6 +267,162 @@ function buildWaitingPage(token, data, deviceOk) {
   </script>
 </body>
 </html>`;
+}
+
+async function handleHostedAsset(request, env, url) {
+  if (!env.ASSETS_R2) return new Response("R2 not configured", { status: 500 });
+  const parts = url.pathname.split("/").filter(Boolean);
+  const prefix = parts[1];
+  if (!prefix) return new Response("Not Found", { status: 404 });
+  let relPath = parts.slice(2).join("/") || "index.html";
+  if (relPath.endsWith("/")) relPath += "index.html";
+  if (relPath === "_capture.js") {
+    return new Response(buildCaptureScript(), {
+      headers: {
+        "content-type": "application/javascript; charset=utf-8",
+        ...corsHeaders(),
+      },
+    });
+  }
+
+  const accessToken = url.searchParams.get("access_token") || "";
+  const tokenData = accessToken ? await getTokenData(env, accessToken) : null;
+  const accessConfig = tokenData?.access_config || {};
+  const allowDownload = accessConfig.allow_download !== false;
+  const downloadPolicy = accessConfig.download_policy || "upload_only";
+
+  const key = `${prefix}/${relPath}`;
+  let object = await env.ASSETS_R2.get(key);
+  if (!object && env.PSYCHOJS_R2) {
+    object = await env.PSYCHOJS_R2.get(relPath);
+  }
+  if (!object) return new Response("Not Found", { status: 404 });
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "public, max-age=300");
+  headers.set("Access-Control-Allow-Origin", "*");
+
+  const contentType = headers.get("content-type") || "";
+  const isHtml = contentType.includes("text/html") || relPath.endsWith(".html");
+  if (!isHtml) {
+    return new Response(object.body, { headers });
+  }
+
+  const html = await object.text();
+  const injected = injectCaptureScript(html, {
+    prefix,
+    accessToken,
+    allowDownload,
+    downloadPolicy,
+  });
+  headers.set("content-type", "text/html; charset=utf-8");
+  return new Response(injected, { headers });
+}
+
+function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloadPolicy }) {
+  const payload = {
+    prefix,
+    access_token: accessToken || "",
+    allow_download: allowDownload !== false,
+    download_policy: downloadPolicy || "upload_only",
+  };
+  const inline = `<script>window.__EXP_CAPTURE__=${JSON.stringify(payload)};</script>`
+    + `<script src="/exp/${encodeURIComponent(prefix)}/_capture.js"></script>`;
+  if (html.includes("</head>")) {
+    return html.replace("</head>", `${inline}</head>`);
+  }
+  return `${html}\n${inline}`;
+}
+
+function buildCaptureScript() {
+  return `(() => {
+  const config = window.__EXP_CAPTURE__ || {};
+  const prefix = config.prefix || "";
+  const accessToken = config.access_token || new URLSearchParams(location.search).get("access_token") || "";
+  const downloadPolicy = config.download_policy || "upload_only";
+  const allowDownload = config.allow_download !== false;
+
+  const post = (payload) => {
+    if (!prefix) return;
+    const body = JSON.stringify({
+      prefix,
+      access_token: accessToken,
+      download_policy: downloadPolicy,
+      payload,
+    });
+    if (navigator.sendBeacon) {
+      const blob = new Blob([body], { type: "application/json" });
+      navigator.sendBeacon("/data/collect", blob);
+      return;
+    }
+    fetch("/data/collect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    }).catch(() => {});
+  };
+
+  const extractPsychoData = () => {
+    try {
+      const psycho = window.psychoJS || window.psychojs || window.PsychoJS;
+      const exp = psycho?.experiment || psycho?._experiment;
+      const data = exp?._trialsData || exp?._trialList || null;
+      if (data) post({ type: "psychojs_data", data });
+    } catch {
+      // ignore
+    }
+  };
+
+  const blockDownload = () => {
+    if (allowDownload) return;
+    if (typeof window.saveAs === "function") {
+      const original = window.saveAs;
+      window.saveAs = function () {
+        post({ type: "download_blocked", ts: Date.now() });
+        return undefined;
+      };
+      window.saveAs.__original = original;
+    }
+  };
+
+  window.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") extractPsychoData();
+  });
+  window.addEventListener("beforeunload", extractPsychoData);
+
+  setTimeout(blockDownload, 500);
+})();`;
+}
+
+async function handleDataCollect(request, env) {
+  if (!env.DATA_R2) return json({ error: "DATA_R2 not configured" }, 500);
+  const text = await request.text();
+  let data = {};
+  try {
+    data = JSON.parse(text || "{}") || {};
+  } catch {
+    data = {};
+  }
+  const prefix = String(data.prefix || "").trim();
+  if (!prefix) return json({ error: "Missing prefix" }, 400);
+  const accessToken = String(data.access_token || "").trim();
+  const safeToken = accessToken.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 120) || "anonymous";
+  const rand = crypto.getRandomValues(new Uint8Array(6));
+  const suffix = Array.from(rand, (b) => b.toString(16).padStart(2, "0")).join("");
+  const key = `${prefix}/${safeToken}/${Date.now()}_${suffix}.json`;
+  const payload = {
+    received_at: new Date().toISOString(),
+    ip: request.headers.get("cf-connecting-ip") || "",
+    user_agent: request.headers.get("user-agent") || "",
+    ...data,
+  };
+  await env.DATA_R2.put(key, JSON.stringify(payload), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return json({ ok: true, key });
 }
 
 async function handleAccessPage(request, env, token) {
