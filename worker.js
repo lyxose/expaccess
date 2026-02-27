@@ -162,8 +162,8 @@ function buildWaitingPage(token, data, deviceOk) {
     ? appendTokenToUrl(data.target_url, token)
     : `/proxy/${token}/`;
   const policyNote = isUnscheduled
-    ? "请在 10 分钟内进入实验，仅能启动一次，确认准备好后再进入。"
-    : "仅能启动一次，请勿刷新页面。";
+    ? "请在 10 分钟内进入实验，仅能启动一次，确认准备好后再进入。进入实验后请勿刷新或重新打开。"
+    : "仅能启动一次，请勿刷新页面。进入实验后请勿重新打开。";
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -311,20 +311,15 @@ async function handleHostedAsset(request, env, url) {
       return new Response("Too early", { status: 409 });
     }
     const docRequest = isDocumentRequest(request);
-    if (tokenData.used_at_ms && docRequest) {
-      const info = getClientInfo(request);
-      const sameClient = (!tokenData.used_ip || tokenData.used_ip === info.ip)
-        && (!tokenData.used_ua || tokenData.used_ua === info.ua);
-      if (!sameClient) {
+    if (docRequest) {
+      if (tokenData.hosted_content_used_at_ms) {
         return new Response("Token already used", { status: 409 });
       }
-    }
-    if (!tokenData.used_at_ms && docRequest) {
       const info = getClientInfo(request);
-      tokenData.used_at_ms = now;
-      tokenData.used_at = new Date().toISOString();
-      tokenData.used_ip = info.ip;
-      tokenData.used_ua = info.ua;
+      tokenData.hosted_content_used_at_ms = now;
+      tokenData.hosted_content_used_at = new Date().toISOString();
+      tokenData.hosted_used_ip = info.ip;
+      tokenData.hosted_used_ua = info.ua;
       await saveTokenData(env, accessToken, tokenData);
     }
     if (tokenData.used_at_ms && now > tokenData.used_at_ms + DEFAULT_GRACE_MS) {
@@ -431,7 +426,11 @@ function buildCaptureScript() {
     exp.save = async function (...args) {
       let result;
       try {
-        result = await original(...args);
+        if (downloadPolicy === "upload_only") {
+          result = undefined;
+        } else {
+          result = await original(...args);
+        }
       } finally {
         try {
           const data = exp._trialsData || exp._trialList || exp._data || null;
@@ -555,6 +554,12 @@ async function handleTokenVerify(request, env) {
   const sessionId = getSessionId(request);
 
   if (data.mode === "token") {
+    if (data.hosted_content_used_at_ms) {
+      return json({ error: "Token already used" }, 409);
+    }
+    if (data.access_config?.hosted) {
+      return json({ ok: true, start_at_ms: startMs });
+    }
     if (data.used_at_ms) {
       return json({ error: "Token already used" }, 409);
     }
