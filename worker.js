@@ -362,27 +362,52 @@ async function handleHostedAsset(request, env, url) {
 }
 
 function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloadPolicy }) {
-  const payload = {
-    prefix,
-    access_token: accessToken || "",
-    allow_download: allowDownload !== false,
-    download_policy: downloadPolicy || "upload_only",
-  };
-  const inline = `<script>window.__EXP_CAPTURE__=${JSON.stringify(payload)};</script>`
-    + `<script src="/exp/${encodeURIComponent(prefix)}/_capture.js"></script>`;
+  const params = new URLSearchParams({
+    prefix: String(prefix || ""),
+    token: String(accessToken || ""),
+    policy: String(downloadPolicy || "upload_only"),
+  });
+  const scriptTag = `<script src="/exp/${encodeURIComponent(prefix)}/_capture.js?${params.toString()}"></script>`;
   if (html.includes("</head>")) {
-    return html.replace("</head>", `${inline}</head>`);
+    return html.replace("</head>", `${scriptTag}</head>`);
   }
-  return `${html}\n${inline}`;
+  return `${html}\n${scriptTag}`;
 }
 
 function buildCaptureScript() {
   return `(() => {
-  const config = window.__EXP_CAPTURE__ || {};
-  const prefix = config.prefix || "";
-  const accessToken = config.access_token || new URLSearchParams(location.search).get("access_token") || "";
-  const downloadPolicy = config.download_policy || "upload_only";
-  const allowDownload = config.allow_download !== false;
+  const readConfig = () => {
+    const config = window.__EXP_CAPTURE__ || {};
+    const current = document.currentScript;
+    let prefix = config.prefix || "";
+    let accessToken = config.access_token || "";
+    let downloadPolicy = config.download_policy || "";
+    if (current && current.src) {
+      try {
+        const srcUrl = new URL(current.src, location.href);
+        if (!prefix) prefix = srcUrl.searchParams.get("prefix") || "";
+        if (!accessToken) accessToken = srcUrl.searchParams.get("token") || "";
+        if (!downloadPolicy) downloadPolicy = srcUrl.searchParams.get("policy") || "";
+      } catch {
+        // ignore
+      }
+    }
+    if (!prefix) {
+      const match = location.pathname.match(/^\/exp\/([^/]+)\//);
+      if (match) prefix = match[1];
+    }
+    if (!accessToken) {
+      accessToken = new URLSearchParams(location.search).get("access_token") || "";
+    }
+    return {
+      prefix,
+      accessToken,
+      downloadPolicy: downloadPolicy || "upload_only",
+    };
+  };
+
+  const { prefix, accessToken, downloadPolicy } = readConfig();
+  const allowDownload = downloadPolicy !== "upload_only";
 
   const post = (payload) => {
     if (!prefix) return;
@@ -446,16 +471,55 @@ function buildCaptureScript() {
   };
 
   const blockDownload = () => {
-    if (allowDownload) return;
-    if (typeof window.saveAs === "function") {
+    if (allowDownload) return true;
+    if (typeof window.saveAs === "function" && !window.saveAs.__blocked) {
       const original = window.saveAs;
-      window.saveAs = function () {
-        post({ type: "download_blocked", ts: Date.now() });
+      const blocked = function () {
+        post({ type: "download_blocked", ts: Date.now(), source: "saveAs" });
         return undefined;
       };
-      window.saveAs.__original = original;
+      blocked.__original = original;
+      blocked.__blocked = true;
+      window.saveAs = blocked;
     }
+    if (typeof navigator.msSaveOrOpenBlob === "function" && !navigator.msSaveOrOpenBlob.__blocked) {
+      const originalMs = navigator.msSaveOrOpenBlob;
+      navigator.msSaveOrOpenBlob = function () {
+        post({ type: "download_blocked", ts: Date.now(), source: "msSaveOrOpenBlob" });
+        return false;
+      };
+      navigator.msSaveOrOpenBlob.__original = originalMs;
+      navigator.msSaveOrOpenBlob.__blocked = true;
+    }
+    if (!window.__EXP_DOWNLOAD_GUARD__) {
+      window.__EXP_DOWNLOAD_GUARD__ = true;
+      document.addEventListener("click", (event) => {
+        const target = event.target?.closest ? event.target.closest("a") : null;
+        if (!target) return;
+        const href = target.getAttribute("href") || "";
+        const hasDownload = target.hasAttribute("download");
+        const isBlob = href.startsWith("blob:") || href.startsWith("data:");
+        if (hasDownload || isBlob) {
+          event.preventDefault();
+          post({ type: "download_blocked", ts: Date.now(), source: "anchor", href });
+        }
+      }, true);
+
+      const originalOpen = window.open;
+      window.open = function (url, ...rest) {
+        if (typeof url === "string" && (url.startsWith("blob:") || url.startsWith("data:"))) {
+          post({ type: "download_blocked", ts: Date.now(), source: "window.open", href: url });
+          return null;
+        }
+        return originalOpen.call(window, url, ...rest);
+      };
+    }
+    return Boolean(window.saveAs && window.saveAs.__blocked);
   };
+
+  if (prefix) {
+    post({ type: "capture_loaded", ts: Date.now() });
+  }
 
   window.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") extractPsychoData();
@@ -468,7 +532,11 @@ function buildCaptureScript() {
     }
   }, 500);
 
-  setTimeout(blockDownload, 500);
+  const blockTimer = setInterval(() => {
+    if (blockDownload()) {
+      clearInterval(blockTimer);
+    }
+  }, 500);
 })();`;
 }
 
