@@ -408,6 +408,12 @@ function buildCaptureScript() {
 
   const { prefix, accessToken, downloadPolicy } = readConfig();
   const allowDownload = downloadPolicy !== "upload_only";
+  window.__EXP_CONFIG__ = {
+    prefix,
+    accessToken,
+    downloadPolicy,
+  };
+  window.__EXP_CAPTURE_LOADED__ = true;
 
   const post = (payload) => {
     if (!prefix) return;
@@ -418,7 +424,7 @@ function buildCaptureScript() {
       download_policy: downloadPolicy,
       payload,
     });
-    if (navigator.sendBeacon) {
+    if (document.visibilityState === "hidden" && navigator.sendBeacon) {
       const blob = new Blob([body], { type: "application/json" });
       navigator.sendBeacon("/data/collect", blob);
       return;
@@ -504,6 +510,18 @@ function buildCaptureScript() {
           post({ type: "download_blocked", ts: Date.now(), source: "anchor", href });
         }
       }, true);
+
+      const originalAnchorClick = HTMLAnchorElement.prototype.click;
+      HTMLAnchorElement.prototype.click = function (...args) {
+        const href = this.getAttribute("href") || "";
+        const hasDownload = this.hasAttribute("download");
+        const isBlob = href.startsWith("blob:") || href.startsWith("data:");
+        if (hasDownload || isBlob) {
+          post({ type: "download_blocked", ts: Date.now(), source: "anchor.click", href });
+          return undefined;
+        }
+        return originalAnchorClick.apply(this, args);
+      };
 
       const originalOpen = window.open;
       window.open = function (url, ...rest) {
