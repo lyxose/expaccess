@@ -312,11 +312,19 @@ async function handleHostedAsset(request, env, url) {
     }
     const docRequest = isDocumentRequest(request);
     if (tokenData.used_at_ms && docRequest) {
-      return new Response("Token already used", { status: 409 });
+      const info = getClientInfo(request);
+      const sameClient = (!tokenData.used_ip || tokenData.used_ip === info.ip)
+        && (!tokenData.used_ua || tokenData.used_ua === info.ua);
+      if (!sameClient) {
+        return new Response("Token already used", { status: 409 });
+      }
     }
     if (!tokenData.used_at_ms && docRequest) {
+      const info = getClientInfo(request);
       tokenData.used_at_ms = now;
       tokenData.used_at = new Date().toISOString();
+      tokenData.used_ip = info.ip;
+      tokenData.used_ua = info.ua;
       await saveTokenData(env, accessToken, tokenData);
     }
     if (tokenData.used_at_ms && now > tokenData.used_at_ms + DEFAULT_GRACE_MS) {
@@ -324,8 +332,9 @@ async function handleHostedAsset(request, env, url) {
     }
   }
   const accessConfig = tokenData?.access_config || {};
-  const allowDownload = accessConfig.allow_download !== false;
-  const downloadPolicy = accessConfig.download_policy || "upload_only";
+  const downloadPolicy = accessConfig.download_policy
+    || (accessConfig.allow_download ? "download_and_upload" : "upload_only");
+  const allowDownload = downloadPolicy !== "upload_only";
 
   const key = `${prefix}/${relPath}`;
   let object = await env.ASSETS_R2.get(key);
@@ -382,6 +391,7 @@ function buildCaptureScript() {
 
   const post = (payload) => {
     if (!prefix) return;
+    if (downloadPolicy === "download_only") return;
     const body = JSON.stringify({
       prefix,
       access_token: accessToken,
