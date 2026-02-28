@@ -162,8 +162,8 @@ function buildWaitingPage(token, data, deviceOk) {
     ? appendTokenToUrl(data.target_url, token)
     : `/proxy/${token}/`;
   const policyNote = isUnscheduled
-    ? "请在 10 分钟内进入实验，仅能启动一次，确认准备好后再进入。进入实验后请勿刷新或重新打开。"
-    : "仅能启动一次，请勿刷新页面。进入实验后请勿重新打开。";
+    ? "正式开始后仅能访问一次。请在 10 分钟内进入实验，并确认准备好后再进入。"
+    : "正式开始后仅能访问一次。请勿刷新页面或重新打开。";
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -176,6 +176,7 @@ function buildWaitingPage(token, data, deviceOk) {
     .hint { color: #6b7280; font-size: 0.95rem; }
     .timer { font-size: 2rem; font-weight: 700; margin: 1rem 0; }
     .warn { color: #b42318; }
+    .critical { margin: 0.8rem 0 0.4rem; padding: 0.75rem 0.9rem; border-radius: 12px; background: #fff1f2; border: 1px solid #fecdd3; color: #9f1239; font-weight: 700; font-size: 0.96rem; }
     .primary { border: none; padding: 0.75rem 1.6rem; border-radius: 12px; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; }
     .primary[disabled] { opacity: 0.6; cursor: not-allowed; }
   </style>
@@ -183,7 +184,8 @@ function buildWaitingPage(token, data, deviceOk) {
 <body>
   <div class="card">
     <h2>实验即将开始</h2>
-    <p class="hint">${policyNote}</p>
+    <p class="critical">⚠️ ${policyNote}</p>
+    <p class="hint">若误刷新或重复打开，链接会立即失效。</p>
     <div class="timer" id="timer">--:--</div>
     <button class="primary" id="startBtn" style="display:${isUnscheduled ? "inline-block" : "none"}">我已准备好，进入实验</button>
     <p class="hint" id="status"></p>
@@ -379,8 +381,6 @@ function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloa
 
 function buildCaptureScript() {
   return `(() => {
-  window.__EXP_CAPTURE_LOADED__ = "boot";
-  try {
   const readConfig = () => {
     const config = window.__EXP_CAPTURE__ || {};
     const current = document.currentScript;
@@ -413,12 +413,6 @@ function buildCaptureScript() {
 
   const { prefix, accessToken, downloadPolicy } = readConfig();
   const allowDownload = downloadPolicy !== "upload_only";
-  window.__EXP_CONFIG__ = {
-    prefix,
-    accessToken,
-    downloadPolicy,
-  };
-  window.__EXP_CAPTURE_LOADED__ = true;
 
   const post = (payload) => {
     if (!prefix) return;
@@ -590,10 +584,6 @@ function buildCaptureScript() {
     return Boolean(window.saveAs && window.saveAs.__blocked);
   };
 
-  if (prefix) {
-    post({ type: "capture_loaded", ts: Date.now() });
-  }
-
   window.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") extractPsychoData();
   });
@@ -616,10 +606,6 @@ function buildCaptureScript() {
       clearInterval(blockTimer);
     }
   }, 500);
-  } catch (error) {
-    window.__EXP_CAPTURE_LOADED__ = "error";
-    window.__EXP_CAPTURE_ERROR__ = String(error && error.stack ? error.stack : error);
-  }
 })();`;
 }
 
