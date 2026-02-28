@@ -163,7 +163,7 @@ function buildWaitingPage(token, data, deviceOk) {
     : `/proxy/${token}/`;
   const policyNote = isUnscheduled
     ? "正式开始后仅能访问一次。请在 10 分钟内进入实验，并确认准备好后再进入。"
-    : "正式开始后仅能访问一次。请勿刷新页面或重新打开。";
+    : "正式开始后仅能访问一次。开始后请勿刷新页面或重新打开。";
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -185,7 +185,7 @@ function buildWaitingPage(token, data, deviceOk) {
   <div class="card">
     <h2>实验即将开始</h2>
     <p class="critical">⚠️ ${policyNote}</p>
-    <p class="hint">若误刷新或重复打开，链接会立即失效。</p>
+    <p class="hint">若在实验开始后刷新或重复打开，链接会立即失效。</p>
     <div class="timer" id="timer">--:--</div>
     <button class="primary" id="startBtn" style="display:${isUnscheduled ? "inline-block" : "none"}">我已准备好，进入实验</button>
     <p class="hint" id="status"></p>
@@ -199,6 +199,19 @@ function buildWaitingPage(token, data, deviceOk) {
     const statusEl = document.getElementById("status");
     const timerEl = document.getElementById("timer");
     const startBtn = document.getElementById("startBtn");
+    let entering = false;
+    let timerId = null;
+
+    function enterExperiment() {
+      if (entering) return;
+      entering = true;
+      if (timerId) {
+        clearInterval(timerId);
+        timerId = null;
+      }
+      statusEl.textContent = "正在进入实验...";
+      location.replace(targetUrl);
+    }
 
     if (!deviceOk) {
       statusEl.textContent = "当前设备不符合要求，请使用允许的设备打开链接。";
@@ -230,8 +243,7 @@ function buildWaitingPage(token, data, deviceOk) {
       const remaining = startMs - now;
       timerEl.textContent = format(remaining);
       if (remaining <= 0 && deviceOk) {
-        statusEl.textContent = "正在进入实验...";
-        location.href = targetUrl;
+        enterExperiment();
       }
     }
 
@@ -256,8 +268,7 @@ function buildWaitingPage(token, data, deviceOk) {
             statusEl.classList.add("warn");
             return;
           }
-          statusEl.textContent = "正在进入实验...";
-          location.href = targetUrl;
+          enterExperiment();
         } catch {
           statusEl.textContent = "验证失败，请检查网络后重试。";
           statusEl.classList.add("warn");
@@ -265,7 +276,7 @@ function buildWaitingPage(token, data, deviceOk) {
       });
     }
     tick();
-    setInterval(tick, 500);
+    timerId = setInterval(tick, 500);
   </script>
 </body>
 </html>`;
