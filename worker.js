@@ -368,7 +368,7 @@ function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloa
     prefix: String(prefix || ""),
     token: String(accessToken || ""),
     policy: String(downloadPolicy || "upload_only"),
-    v: "20260228-2",
+    v: "20260228-3",
   });
   const scriptTag = `<script src="/exp/${encodeURIComponent(prefix)}/_capture.js?${params.toString()}"></script>`;
   if (html.includes("</head>")) {
@@ -398,8 +398,8 @@ function buildCaptureScript() {
       }
     }
     if (!prefix) {
-      const match = location.pathname.match(/^\/exp\/([^/]+)\//);
-      if (match) prefix = match[1];
+      const parts = String(location.pathname || "").split("/").filter(Boolean);
+      if (parts[0] === "exp" && parts[1]) prefix = parts[1];
     }
     if (!accessToken) {
       accessToken = new URLSearchParams(location.search).get("access_token") || "";
