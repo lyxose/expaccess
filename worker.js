@@ -280,6 +280,8 @@ async function handleHostedAsset(request, env, url) {
     return new Response(buildCaptureScript(), {
       headers: {
         "content-type": "application/javascript; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+        pragma: "no-cache",
         ...corsHeaders(),
       },
     });
@@ -366,6 +368,7 @@ function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloa
     prefix: String(prefix || ""),
     token: String(accessToken || ""),
     policy: String(downloadPolicy || "upload_only"),
+    v: "20260228-2",
   });
   const scriptTag = `<script src="/exp/${encodeURIComponent(prefix)}/_capture.js?${params.toString()}"></script>`;
   if (html.includes("</head>")) {
@@ -376,6 +379,8 @@ function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloa
 
 function buildCaptureScript() {
   return `(() => {
+  window.__EXP_CAPTURE_LOADED__ = "boot";
+  try {
   const readConfig = () => {
     const config = window.__EXP_CAPTURE__ || {};
     const current = document.currentScript;
@@ -476,6 +481,35 @@ function buildCaptureScript() {
     return true;
   };
 
+  const hookPsychoDownloadFns = () => {
+    if (allowDownload) return true;
+    let hooked = false;
+    if (window.util && typeof window.util.offerDataForDownload === "function" && !window.util.offerDataForDownload.__blocked) {
+      const originalOffer = window.util.offerDataForDownload;
+      window.util.offerDataForDownload = function (...args) {
+        post({ type: "download_blocked", ts: Date.now(), source: "util.offerDataForDownload", args: [String(args?.[0] || "")] });
+        return undefined;
+      };
+      window.util.offerDataForDownload.__original = originalOffer;
+      window.util.offerDataForDownload.__blocked = true;
+      hooked = true;
+    }
+    if (window.psychoJS && window.psychoJS.constructor && window.psychoJS.constructor.prototype) {
+      const proto = window.psychoJS.constructor.prototype;
+      if (typeof proto.downloadData === "function" && !proto.downloadData.__blocked) {
+        const originalDownloadData = proto.downloadData;
+        proto.downloadData = function (...args) {
+          post({ type: "download_blocked", ts: Date.now(), source: "psychoJS.downloadData" });
+          return undefined;
+        };
+        proto.downloadData.__original = originalDownloadData;
+        proto.downloadData.__blocked = true;
+        hooked = true;
+      }
+    }
+    return hooked;
+  };
+
   const blockDownload = () => {
     if (allowDownload) return true;
     if (typeof window.saveAs === "function" && !window.saveAs.__blocked) {
@@ -496,6 +530,27 @@ function buildCaptureScript() {
       };
       navigator.msSaveOrOpenBlob.__original = originalMs;
       navigator.msSaveOrOpenBlob.__blocked = true;
+    }
+    if (typeof navigator.msSaveBlob === "function" && !navigator.msSaveBlob.__blocked) {
+      const originalSaveBlob = navigator.msSaveBlob;
+      navigator.msSaveBlob = function () {
+        post({ type: "download_blocked", ts: Date.now(), source: "msSaveBlob" });
+        return false;
+      };
+      navigator.msSaveBlob.__original = originalSaveBlob;
+      navigator.msSaveBlob.__blocked = true;
+    }
+    if (window.URL && typeof window.URL.createObjectURL === "function" && !window.URL.createObjectURL.__guarded) {
+      const originalCreateObjectURL = window.URL.createObjectURL.bind(window.URL);
+      window.URL.createObjectURL = function (obj) {
+        const type = obj && typeof obj.type === "string" ? obj.type : "";
+        if (!allowDownload && (type.includes("text/csv") || type.includes("application/json") || type.includes("text/plain"))) {
+          post({ type: "download_blocked", ts: Date.now(), source: "URL.createObjectURL", blobType: type });
+          return "about:blank#blocked-download";
+        }
+        return originalCreateObjectURL(obj);
+      };
+      window.URL.createObjectURL.__guarded = true;
     }
     if (!window.__EXP_DOWNLOAD_GUARD__) {
       window.__EXP_DOWNLOAD_GUARD__ = true;
@@ -550,11 +605,21 @@ function buildCaptureScript() {
     }
   }, 500);
 
+  const psychoDownloadHookTimer = setInterval(() => {
+    if (hookPsychoDownloadFns()) {
+      clearInterval(psychoDownloadHookTimer);
+    }
+  }, 500);
+
   const blockTimer = setInterval(() => {
     if (blockDownload()) {
       clearInterval(blockTimer);
     }
   }, 500);
+  } catch (error) {
+    window.__EXP_CAPTURE_LOADED__ = "error";
+    window.__EXP_CAPTURE_ERROR__ = String(error && error.stack ? error.stack : error);
+  }
 })();`;
 }
 
