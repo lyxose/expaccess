@@ -71,6 +71,57 @@ function json(data, status = 200) {
   });
 }
 
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function sanitizeId(value, fallback = "unknown") {
+  const text = String(value || "").trim();
+  if (!text) return fallback;
+  const safe = text.replace(/[^A-Za-z0-9_-]/g, "");
+  return safe || fallback;
+}
+
+function escapeCsvCell(value) {
+  if (value === null || value === undefined) return "";
+  const text = String(value);
+  if (/[",\n\r\t]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+  return text;
+}
+
+function rowsToTsv(rows) {
+  const list = Array.isArray(rows) ? rows.filter((row) => row && typeof row === "object") : [];
+  if (!list.length) return "";
+  const headers = [];
+  const seen = new Set();
+  for (const row of list) {
+    for (const key of Object.keys(row)) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        headers.push(key);
+      }
+    }
+  }
+  const lines = [headers.map(escapeCsvCell).join("\t")];
+  for (const row of list) {
+    lines.push(headers.map((key) => escapeCsvCell(row[key])).join("\t"));
+  }
+  return `\uFEFF${lines.join("\n")}`;
+}
+
+function extractTabularRows(data) {
+  const payload = data?.payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.data?.psychojs_rows)) return payload.data.psychojs_rows;
+  if (Array.isArray(payload?.psychojs_rows)) return payload.psychojs_rows;
+  if (Array.isArray(data?.psychojs_rows)) return data.psychojs_rows;
+  return [];
+}
+
 function accessErrorResponse(request, status, title, message, code = "access_error") {
   const headers = {
     "cache-control": "no-store",
@@ -850,20 +901,49 @@ async function handleDataCollect(request, env) {
   const prefix = String(data.prefix || "").trim();
   if (!prefix) return json({ error: "Missing prefix" }, 400);
   const accessToken = String(data.access_token || "").trim();
-  const safeToken = accessToken.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 120) || "anonymous";
+
+  let tokenData = null;
+  if (accessToken && env.ACCESS_KV) {
+    const raw = await env.ACCESS_KV.get(`access:${accessToken}`).catch(() => null);
+    tokenData = safeJsonParse(raw, null);
+  }
+
+  const experimentUid = sanitizeId(
+    tokenData?.experiment_uid || data?.experiment_uid || data?.payload?.experiment_uid,
+    "E_UNKNOWN"
+  );
+  const userUid = sanitizeId(
+    tokenData?.user_uid || data?.user_uid || data?.payload?.user_uid || data?.payload?.data?.participant_id,
+    "U_UNKNOWN"
+  );
   const rand = crypto.getRandomValues(new Uint8Array(6));
   const suffix = Array.from(rand, (b) => b.toString(16).padStart(2, "0")).join("");
-  const key = `${prefix}/${safeToken}/${Date.now()}_${suffix}.json`;
+  const baseName = `${Date.now()}_${suffix}`;
+  const folder = `${prefix}/${experimentUid}/${userUid}`;
+  const key = `${folder}/${baseName}.json`;
   const payload = {
     received_at: nowBeijingISOString(),
     ip: request.headers.get("cf-connecting-ip") || "",
     user_agent: request.headers.get("user-agent") || "",
+    experiment_uid: experimentUid,
+    user_uid: userUid,
     ...data,
   };
   await env.DATA_R2.put(key, JSON.stringify(payload), {
     httpMetadata: { contentType: "application/json" },
   });
-  return json({ ok: true, key });
+
+  let csvKey = "";
+  const rows = extractTabularRows(data);
+  const tsv = rowsToTsv(rows);
+  if (tsv) {
+    csvKey = `${folder}/${baseName}.csv`;
+    await env.DATA_R2.put(csvKey, tsv, {
+      httpMetadata: { contentType: "text/csv; charset=utf-8" },
+    });
+  }
+
+  return json({ ok: true, key, csv_key: csvKey || null, experiment_uid: experimentUid, user_uid: userUid });
 }
 
 async function handleAccessPage(request, env, token) {
