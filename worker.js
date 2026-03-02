@@ -656,7 +656,7 @@ function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloa
     prefix: String(prefix || ""),
     token: String(accessToken || ""),
     policy: String(downloadPolicy || "upload_only"),
-    v: "20260228-3",
+    v: "20260302-4",
   });
   const scriptTag = `<script src="/exp/${encodeURIComponent(prefix)}/_capture.js?${params.toString()}"></script>`;
   if (html.includes("</head>")) {
@@ -699,6 +699,7 @@ function buildCaptureScript() {
 
   const { prefix, accessToken, downloadPolicy } = readConfig();
   const allowDownload = downloadPolicy !== "upload_only";
+  const blobUrlMap = new Map();
 
   const post = (payload) => {
     if (!prefix) return;
@@ -753,6 +754,34 @@ function buildCaptureScript() {
     }
   };
 
+  const captureBlobArtifact = (blob, fileName, source) => {
+    if (!(blob instanceof Blob)) return;
+    const safeName = String(fileName || ("download_" + Date.now() + ".txt"));
+    const blobType = String(blob.type || guessTypeByName(safeName));
+    const isTextLike = /csv|json|text|plain/i.test(blobType) || /\.(csv|json|txt)$/i.test(safeName);
+    if (!isTextLike) return;
+    blob.text().then((text) => postArtifact(safeName, text, blobType, source)).catch(() => {});
+  };
+
+  const captureDataUrlText = (href, fileName, source) => {
+    const raw = String(href || "");
+    if (!raw.startsWith("data:")) return;
+    const comma = raw.indexOf(",");
+    if (comma < 0) return;
+    const meta = raw.slice(5, comma);
+    const body = raw.slice(comma + 1);
+    const isBase64 = /;base64/i.test(meta);
+    const mime = (meta.split(";")[0] || "text/plain").trim() || "text/plain";
+    try {
+      const text = isBase64
+        ? decodeBytes(Uint8Array.from(atob(body), (ch) => ch.charCodeAt(0)))
+        : decodeURIComponent(body);
+      postArtifact(fileName || ("download_" + Date.now() + ".txt"), text, mime + "; charset=utf-8", source);
+    } catch {
+      // ignore
+    }
+  };
+
   const captureDownloadPayload = (args, source) => {
     const fileName = String(args?.[0] || ("download_" + Date.now() + ".csv"));
     const payload = args?.[1];
@@ -763,10 +792,7 @@ function buildCaptureScript() {
       return;
     }
     if (payload instanceof Blob) {
-      const blobType = String(payload.type || explicitType || guessTypeByName(fileName));
-      const isTextLike = /csv|json|text|plain/i.test(blobType) || /\.(csv|json|txt)$/i.test(fileName);
-      if (!isTextLike) return;
-      payload.text().then((text) => postArtifact(fileName, text, blobType, source)).catch(() => {});
+      captureBlobArtifact(payload, fileName, source);
       return;
     }
     if (payload instanceof ArrayBuffer) {
@@ -806,7 +832,8 @@ function buildCaptureScript() {
     exp.save = async function (...args) {
       let result;
       try {
-        if (downloadPolicy === "upload_only") {
+        const disableByRuntime = window.__EXP_CAPTURE_DISABLE_PSYCHO_SAVE__ === true;
+        if (disableByRuntime || downloadPolicy === "upload_only") {
           result = undefined;
         } else {
           result = await original(...args);
@@ -862,83 +889,147 @@ function buildCaptureScript() {
   };
 
   const blockDownload = () => {
-    if (allowDownload) return true;
-    if (typeof window.saveAs === "function" && !window.saveAs.__blocked) {
+    if (typeof window.saveAs === "function" && !window.saveAs.__captured) {
       const original = window.saveAs;
-      const blocked = function () {
-        post({ type: "download_blocked", ts: Date.now(), source: "saveAs" });
-        return undefined;
+      window.saveAs = function (...args) {
+        const blob = args?.[0];
+        const fileName = String(args?.[1] || ("download_" + Date.now() + ".txt"));
+        captureBlobArtifact(blob, fileName, "saveAs");
+        if (!allowDownload) {
+          post({ type: "download_blocked", ts: Date.now(), source: "saveAs", file_name: fileName });
+          return undefined;
+        }
+        return original.apply(this, args);
       };
-      blocked.__original = original;
-      blocked.__blocked = true;
-      window.saveAs = blocked;
+      window.saveAs.__captured = true;
+      window.saveAs.__original = original;
     }
-    if (typeof navigator.msSaveOrOpenBlob === "function" && !navigator.msSaveOrOpenBlob.__blocked) {
+
+    if (typeof navigator.msSaveOrOpenBlob === "function" && !navigator.msSaveOrOpenBlob.__captured) {
       const originalMs = navigator.msSaveOrOpenBlob;
-      navigator.msSaveOrOpenBlob = function () {
-        post({ type: "download_blocked", ts: Date.now(), source: "msSaveOrOpenBlob" });
-        return false;
+      navigator.msSaveOrOpenBlob = function (blob, fileName, ...rest) {
+        captureBlobArtifact(blob, fileName, "msSaveOrOpenBlob");
+        if (!allowDownload) {
+          post({ type: "download_blocked", ts: Date.now(), source: "msSaveOrOpenBlob", file_name: String(fileName || "") });
+          return false;
+        }
+        return originalMs.call(this, blob, fileName, ...rest);
       };
+      navigator.msSaveOrOpenBlob.__captured = true;
       navigator.msSaveOrOpenBlob.__original = originalMs;
-      navigator.msSaveOrOpenBlob.__blocked = true;
     }
-    if (typeof navigator.msSaveBlob === "function" && !navigator.msSaveBlob.__blocked) {
+
+    if (typeof navigator.msSaveBlob === "function" && !navigator.msSaveBlob.__captured) {
       const originalSaveBlob = navigator.msSaveBlob;
-      navigator.msSaveBlob = function () {
-        post({ type: "download_blocked", ts: Date.now(), source: "msSaveBlob" });
-        return false;
+      navigator.msSaveBlob = function (blob, fileName, ...rest) {
+        captureBlobArtifact(blob, fileName, "msSaveBlob");
+        if (!allowDownload) {
+          post({ type: "download_blocked", ts: Date.now(), source: "msSaveBlob", file_name: String(fileName || "") });
+          return false;
+        }
+        return originalSaveBlob.call(this, blob, fileName, ...rest);
       };
+      navigator.msSaveBlob.__captured = true;
       navigator.msSaveBlob.__original = originalSaveBlob;
-      navigator.msSaveBlob.__blocked = true;
     }
+
     if (window.URL && typeof window.URL.createObjectURL === "function" && !window.URL.createObjectURL.__guarded) {
       const originalCreateObjectURL = window.URL.createObjectURL.bind(window.URL);
       window.URL.createObjectURL = function (obj) {
         const type = obj && typeof obj.type === "string" ? obj.type : "";
-        if (!allowDownload && (type.includes("text/csv") || type.includes("application/json") || type.includes("text/plain"))) {
-          post({ type: "download_blocked", ts: Date.now(), source: "URL.createObjectURL", blobType: type });
-          return "about:blank#blocked-download";
+        const isTextLike = type.includes("text/csv") || type.includes("application/json") || type.includes("text/plain");
+        if (obj instanceof Blob) {
+          const url = originalCreateObjectURL(obj);
+          blobUrlMap.set(url, obj);
+          if (!allowDownload && isTextLike) {
+            post({ type: "download_blocked", ts: Date.now(), source: "URL.createObjectURL", blobType: type });
+            return "about:blank#blocked-download";
+          }
+          return url;
         }
         return originalCreateObjectURL(obj);
       };
+      const originalRevoke = window.URL.revokeObjectURL ? window.URL.revokeObjectURL.bind(window.URL) : null;
+      if (originalRevoke && !window.URL.revokeObjectURL.__guarded) {
+        window.URL.revokeObjectURL = function (url) {
+          blobUrlMap.delete(String(url || ""));
+          return originalRevoke(url);
+        };
+        window.URL.revokeObjectURL.__guarded = true;
+      }
       window.URL.createObjectURL.__guarded = true;
     }
+
     if (!window.__EXP_DOWNLOAD_GUARD__) {
       window.__EXP_DOWNLOAD_GUARD__ = true;
       document.addEventListener("click", (event) => {
         const target = event.target?.closest ? event.target.closest("a") : null;
         if (!target) return;
-        const href = target.getAttribute("href") || "";
+        const href = String(target.getAttribute("href") || "");
+        const fileName = String(target.getAttribute("download") || ("download_" + Date.now() + ".txt"));
         const hasDownload = target.hasAttribute("download");
-        const isBlob = href.startsWith("blob:") || href.startsWith("data:");
-        if (hasDownload || isBlob) {
-          event.preventDefault();
-          post({ type: "download_blocked", ts: Date.now(), source: "anchor", href });
+        const isBlob = href.startsWith("blob:");
+        const isData = href.startsWith("data:");
+        if (hasDownload || isBlob || isData) {
+          if (isBlob && blobUrlMap.has(href)) {
+            captureBlobArtifact(blobUrlMap.get(href), fileName, "anchor");
+          }
+          if (isData) {
+            captureDataUrlText(href, fileName, "anchor");
+          }
+          if (!allowDownload) {
+            event.preventDefault();
+            post({ type: "download_blocked", ts: Date.now(), source: "anchor", href, file_name: fileName });
+          }
         }
       }, true);
 
       const originalAnchorClick = HTMLAnchorElement.prototype.click;
       HTMLAnchorElement.prototype.click = function (...args) {
-        const href = this.getAttribute("href") || "";
+        const href = String(this.getAttribute("href") || "");
+        const fileName = String(this.getAttribute("download") || ("download_" + Date.now() + ".txt"));
         const hasDownload = this.hasAttribute("download");
-        const isBlob = href.startsWith("blob:") || href.startsWith("data:");
-        if (hasDownload || isBlob) {
-          post({ type: "download_blocked", ts: Date.now(), source: "anchor.click", href });
-          return undefined;
+        const isBlob = href.startsWith("blob:");
+        const isData = href.startsWith("data:");
+        if (hasDownload || isBlob || isData) {
+          if (isBlob && blobUrlMap.has(href)) {
+            captureBlobArtifact(blobUrlMap.get(href), fileName, "anchor.click");
+          }
+          if (isData) {
+            captureDataUrlText(href, fileName, "anchor.click");
+          }
+          if (!allowDownload) {
+            post({ type: "download_blocked", ts: Date.now(), source: "anchor.click", href, file_name: fileName });
+            return undefined;
+          }
         }
         return originalAnchorClick.apply(this, args);
       };
 
       const originalOpen = window.open;
       window.open = function (url, ...rest) {
-        if (typeof url === "string" && (url.startsWith("blob:") || url.startsWith("data:"))) {
-          post({ type: "download_blocked", ts: Date.now(), source: "window.open", href: url });
-          return null;
+        const href = String(url || "");
+        if (href.startsWith("blob:")) {
+          if (blobUrlMap.has(href)) {
+            captureBlobArtifact(blobUrlMap.get(href), "window_open_download.txt", "window.open");
+          }
+          if (!allowDownload) {
+            post({ type: "download_blocked", ts: Date.now(), source: "window.open", href });
+            return null;
+          }
+        }
+        if (href.startsWith("data:")) {
+          captureDataUrlText(href, "window_open_download.txt", "window.open");
+          if (!allowDownload) {
+            post({ type: "download_blocked", ts: Date.now(), source: "window.open", href });
+            return null;
+          }
         }
         return originalOpen.call(window, url, ...rest);
       };
     }
-    return Boolean(window.saveAs && window.saveAs.__blocked);
+
+    return Boolean(window.__EXP_DOWNLOAD_GUARD__);
   };
 
   window.addEventListener("visibilitychange", () => {
