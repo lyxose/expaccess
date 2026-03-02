@@ -350,18 +350,30 @@ async function handleHostedAsset(request, env, url) {
 
   if (resolvedSource === "github") {
     const githubRepo = accessConfig?.github_repo || prefixSource?.github_repo || "";
-    const targetUrl = buildGitHubRawUrl(githubRepo, relPath);
-    if (!targetUrl) return new Response("Invalid github repo", { status: 400 });
-    const upstream = await fetch(targetUrl, {
-      method: request.method,
-      headers: {
-        "accept": request.headers.get("accept") || "*/*",
-      },
-      redirect: "follow",
-      cf: { cacheTtl: 0, cacheEverything: false },
-    });
-    if (!upstream.ok) {
-      return new Response("Not Found", { status: upstream.status === 404 ? 404 : 502 });
+    const targetUrls = buildGitHubRawCandidates(githubRepo, relPath);
+    if (!targetUrls.length) return new Response("Invalid github repo", { status: 400 });
+    let upstream = null;
+    for (const targetUrl of targetUrls) {
+      const resp = await fetch(targetUrl, {
+        method: request.method,
+        headers: {
+          "accept": request.headers.get("accept") || "*/*",
+        },
+        redirect: "follow",
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (resp.ok) {
+        upstream = resp;
+        break;
+      }
+      if (resp.status !== 404) {
+        upstream = resp;
+        break;
+      }
+    }
+    if (!upstream || !upstream.ok) {
+      const status = upstream?.status === 404 ? 404 : 502;
+      return new Response("Not Found", { status });
     }
     const upstreamType = upstream.headers.get("content-type") || guessContentType(relPath);
     const isHtml = upstreamType.includes("text/html") || relPath.endsWith(".html");
@@ -434,32 +446,40 @@ async function getPrefixSourceConfig(env, prefix) {
   }
 }
 
-function buildGitHubRawUrl(repoUrl, relPath) {
+function buildGitHubRawCandidates(repoUrl, relPath) {
   try {
     const url = new URL(String(repoUrl || ""));
-    if (url.hostname.toLowerCase() !== "github.com") return "";
+    if (url.hostname.toLowerCase() !== "github.com") return [];
     const parts = url.pathname.split("/").filter(Boolean);
-    if (parts.length < 2) return "";
+    if (parts.length < 2) return [];
     const owner = parts[0];
     const repo = (parts[1] || "").replace(/\.git$/i, "");
     let branch = "main";
+    let basePath = "";
+    let explicitBranch = false;
     if (parts[2] === "tree" && parts[3]) {
       branch = parts[3];
+      explicitBranch = true;
+      basePath = parts.slice(4).join("/");
     }
     const cleanPath = String(relPath || "index.html").replace(/^\/+/, "");
-    const encodedPath = cleanPath
+    const combinedPath = [basePath, cleanPath].filter(Boolean).join("/");
+    const encodedPath = combinedPath
       .split("/")
       .filter(Boolean)
       .map((seg) => encodeURIComponent(seg))
       .join("/");
-    const encodedBranch = branch
-      .split("/")
-      .filter(Boolean)
-      .map((seg) => encodeURIComponent(seg))
-      .join("/") || "main";
-    return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodedBranch}/${encodedPath || "index.html"}`;
+    const branches = explicitBranch ? [branch] : ["main", "master"];
+    return branches.map((name) => {
+      const encodedBranch = name
+        .split("/")
+        .filter(Boolean)
+        .map((seg) => encodeURIComponent(seg))
+        .join("/") || "main";
+      return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodedBranch}/${encodedPath || "index.html"}`;
+    });
   } catch {
-    return "";
+    return [];
   }
 }
 
