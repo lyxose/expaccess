@@ -122,6 +122,12 @@ function extractTabularRows(data) {
   return [];
 }
 
+function normalizeArtifactFileName(name, fallback) {
+  const raw = String(name || "").trim();
+  const safe = raw.replace(/[^\w.\-]/g, "_");
+  return safe || fallback;
+}
+
 function accessErrorResponse(request, status, title, message, code = "access_error") {
   const headers = {
     "cache-control": "no-store",
@@ -901,6 +907,7 @@ async function handleDataCollect(request, env) {
   const prefix = String(data.prefix || "").trim();
   if (!prefix) return json({ error: "Missing prefix" }, 400);
   const accessToken = String(data.access_token || "").trim();
+  const platform = String(data?.payload?.platform || data?.platform || "").toLowerCase();
 
   let tokenData = null;
   if (accessToken && env.ACCESS_KV) {
@@ -916,34 +923,40 @@ async function handleDataCollect(request, env) {
     tokenData?.user_uid || data?.user_uid || data?.payload?.user_uid || data?.payload?.data?.participant_id,
     "U_UNKNOWN"
   );
-  const rand = crypto.getRandomValues(new Uint8Array(6));
-  const suffix = Array.from(rand, (b) => b.toString(16).padStart(2, "0")).join("");
-  const baseName = `${Date.now()}_${suffix}`;
-  const folder = `${prefix}/${experimentUid}/${userUid}`;
-  const key = `${folder}/${baseName}.json`;
-  const payload = {
-    received_at: nowBeijingISOString(),
-    ip: request.headers.get("cf-connecting-ip") || "",
-    user_agent: request.headers.get("user-agent") || "",
-    experiment_uid: experimentUid,
-    user_uid: userUid,
-    ...data,
-  };
-  await env.DATA_R2.put(key, JSON.stringify(payload), {
-    httpMetadata: { contentType: "application/json" },
-  });
+  const folder = `${experimentUid}/${userUid}`;
+  const storedKeys = [];
 
-  let csvKey = "";
-  const rows = extractTabularRows(data);
-  const tsv = rowsToTsv(rows);
-  if (tsv) {
-    csvKey = `${folder}/${baseName}.csv`;
-    await env.DATA_R2.put(csvKey, tsv, {
-      httpMetadata: { contentType: "text/csv; charset=utf-8" },
+  const artifacts = Array.isArray(data?.payload?.artifacts) ? data.payload.artifacts : [];
+  for (let i = 0; i < artifacts.length; i += 1) {
+    const item = artifacts[i] || {};
+    const content = typeof item.content === "string" ? item.content : "";
+    if (!content) continue;
+    const fileName = normalizeArtifactFileName(item.file_name, `${Date.now()}_${i}.txt`);
+    const key = `${folder}/${fileName}`;
+    const contentType = String(item.content_type || guessContentType(fileName) || "text/plain; charset=utf-8");
+    await env.DATA_R2.put(key, content, {
+      httpMetadata: { contentType },
     });
+    storedKeys.push(key);
   }
 
-  return json({ ok: true, key, csv_key: csvKey || null, experiment_uid: experimentUid, user_uid: userUid });
+  if (!storedKeys.length && platform !== "mycloud") {
+    const rows = extractTabularRows(data);
+    const tsv = rowsToTsv(rows);
+    if (tsv) {
+      const key = `${folder}/${Date.now()}_raw.csv`;
+      await env.DATA_R2.put(key, tsv, {
+        httpMetadata: { contentType: "text/csv; charset=utf-8" },
+      });
+      storedKeys.push(key);
+    }
+  }
+
+  if (!storedKeys.length) {
+    return json({ error: "No artifact content to store" }, 400);
+  }
+
+  return json({ ok: true, key: storedKeys[0], stored_keys: storedKeys, experiment_uid: experimentUid, user_uid: userUid });
 }
 
 async function handleAccessPage(request, env, token) {
