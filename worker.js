@@ -1,6 +1,17 @@
 const DEFAULT_GRACE_MS = 2 * 60 * 60 * 1000;
 const UNSCHEDULED_GRACE_MS = 10 * 60 * 1000;
 const BOOTSTRAP_GRACE_MS = 20 * 1000;
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function toBeijingISOString(input = Date.now()) {
+  const date = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Date(date.getTime() + BEIJING_OFFSET_MS).toISOString().replace("Z", "+08:00");
+}
+
+function nowBeijingISOString() {
+  return toBeijingISOString(Date.now());
+}
 
 export default {
   async fetch(request, env) {
@@ -375,7 +386,7 @@ async function handleHostedAsset(request, env, url) {
       }
       const info = getClientInfo(request);
       tokenData.hosted_content_used_at_ms = now;
-      tokenData.hosted_content_used_at = new Date().toISOString();
+      tokenData.hosted_content_used_at = nowBeijingISOString();
       tokenData.hosted_used_ip = info.ip;
       tokenData.hosted_used_ua = info.ua;
       await saveTokenData(env, accessToken, tokenData);
@@ -844,7 +855,7 @@ async function handleDataCollect(request, env) {
   const suffix = Array.from(rand, (b) => b.toString(16).padStart(2, "0")).join("");
   const key = `${prefix}/${safeToken}/${Date.now()}_${suffix}.json`;
   const payload = {
-    received_at: new Date().toISOString(),
+    received_at: nowBeijingISOString(),
     ip: request.headers.get("cf-connecting-ip") || "",
     user_agent: request.headers.get("user-agent") || "",
     ...data,
@@ -919,7 +930,7 @@ async function handleTokenVerify(request, env) {
       return json({ error: "Token already used" }, 409);
     }
     data.used_at_ms = now;
-    data.used_at = new Date().toISOString();
+    data.used_at = nowBeijingISOString();
     await saveTokenData(env, token, data);
     return json({ ok: true, start_at_ms: startMs });
   }
@@ -991,7 +1002,7 @@ async function handleProxy(request, env, token, restPath, search) {
   } else {
     const info = getClientInfo(request);
     data.used_at_ms = now;
-    data.used_at = new Date().toISOString();
+    data.used_at = nowBeijingISOString();
     data.used_session_id = activeSessionId;
     data.used_ip = info.ip;
     data.used_ua = info.ua;
