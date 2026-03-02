@@ -722,6 +722,70 @@ function buildCaptureScript() {
     }).catch(() => {});
   };
 
+  const guessTypeByName = (name) => {
+    const lower = String(name || "").toLowerCase();
+    if (lower.endsWith(".csv")) return "text/csv; charset=utf-8";
+    if (lower.endsWith(".json")) return "application/json; charset=utf-8";
+    if (lower.endsWith(".txt")) return "text/plain; charset=utf-8";
+    return "text/plain; charset=utf-8";
+  };
+
+  const postArtifact = (fileName, content, contentType, source) => {
+    const text = typeof content === "string" ? content : "";
+    if (!text) return;
+    post({
+      platform: "mycloud",
+      type: "download_capture",
+      source,
+      artifacts: [{
+        file_name: String(fileName || ("download_" + Date.now() + ".txt")),
+        content_type: String(contentType || guessTypeByName(fileName)),
+        content: text,
+      }],
+    });
+  };
+
+  const decodeBytes = (bytes) => {
+    try {
+      return new TextDecoder("utf-8").decode(bytes);
+    } catch {
+      return "";
+    }
+  };
+
+  const captureDownloadPayload = (args, source) => {
+    const fileName = String(args?.[0] || ("download_" + Date.now() + ".csv"));
+    const payload = args?.[1];
+    const explicitType = String(args?.[2] || "");
+
+    if (typeof payload === "string") {
+      postArtifact(fileName, payload, explicitType || guessTypeByName(fileName), source);
+      return;
+    }
+    if (payload instanceof Blob) {
+      const blobType = String(payload.type || explicitType || guessTypeByName(fileName));
+      const isTextLike = /csv|json|text|plain/i.test(blobType) || /\.(csv|json|txt)$/i.test(fileName);
+      if (!isTextLike) return;
+      payload.text().then((text) => postArtifact(fileName, text, blobType, source)).catch(() => {});
+      return;
+    }
+    if (payload instanceof ArrayBuffer) {
+      postArtifact(fileName, decodeBytes(new Uint8Array(payload)), explicitType || guessTypeByName(fileName), source);
+      return;
+    }
+    if (ArrayBuffer.isView(payload)) {
+      postArtifact(fileName, decodeBytes(new Uint8Array(payload.buffer)), explicitType || guessTypeByName(fileName), source);
+      return;
+    }
+    if (payload && typeof payload === "object") {
+      try {
+        postArtifact(fileName, JSON.stringify(payload), explicitType || "application/json; charset=utf-8", source);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   const extractPsychoData = () => {
     try {
       const psycho = window.psychoJS || window.psychojs || window.PsychoJS;
@@ -762,28 +826,35 @@ function buildCaptureScript() {
   };
 
   const hookPsychoDownloadFns = () => {
-    if (allowDownload) return true;
     let hooked = false;
-    if (window.util && typeof window.util.offerDataForDownload === "function" && !window.util.offerDataForDownload.__blocked) {
+    if (window.util && typeof window.util.offerDataForDownload === "function" && !window.util.offerDataForDownload.__captured) {
       const originalOffer = window.util.offerDataForDownload;
       window.util.offerDataForDownload = function (...args) {
-        post({ type: "download_blocked", ts: Date.now(), source: "util.offerDataForDownload", args: [String(args?.[0] || "")] });
-        return undefined;
+        captureDownloadPayload(args, "util.offerDataForDownload");
+        if (!allowDownload) {
+          post({ type: "download_blocked", ts: Date.now(), source: "util.offerDataForDownload", args: [String(args?.[0] || "")] });
+          return undefined;
+        }
+        return originalOffer.apply(this, args);
       };
       window.util.offerDataForDownload.__original = originalOffer;
-      window.util.offerDataForDownload.__blocked = true;
+      window.util.offerDataForDownload.__captured = true;
       hooked = true;
     }
     if (window.psychoJS && window.psychoJS.constructor && window.psychoJS.constructor.prototype) {
       const proto = window.psychoJS.constructor.prototype;
-      if (typeof proto.downloadData === "function" && !proto.downloadData.__blocked) {
+      if (typeof proto.downloadData === "function" && !proto.downloadData.__captured) {
         const originalDownloadData = proto.downloadData;
         proto.downloadData = function (...args) {
-          post({ type: "download_blocked", ts: Date.now(), source: "psychoJS.downloadData" });
-          return undefined;
+          captureDownloadPayload(args, "psychoJS.downloadData");
+          if (!allowDownload) {
+            post({ type: "download_blocked", ts: Date.now(), source: "psychoJS.downloadData" });
+            return undefined;
+          }
+          return originalDownloadData.apply(this, args);
         };
         proto.downloadData.__original = originalDownloadData;
-        proto.downloadData.__blocked = true;
+        proto.downloadData.__captured = true;
         hooked = true;
       }
     }
