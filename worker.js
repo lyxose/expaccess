@@ -495,37 +495,71 @@ function buildGitHubRawCandidates(repoUrl, relPath) {
   try {
     const url = new URL(String(repoUrl || ""));
     if (url.hostname.toLowerCase() !== "github.com") return [];
-    const parts = url.pathname.split("/").filter(Boolean);
-    if (parts.length < 2) return [];
-    const owner = parts[0];
-    const repo = (parts[1] || "").replace(/\.git$/i, "");
-    let branch = "main";
-    let basePath = "";
-    let explicitBranch = false;
-    if (parts[2] === "tree" && parts[3]) {
-      branch = parts[3];
-      explicitBranch = true;
-      basePath = parts.slice(4).join("/");
-    }
+    const specs = parseGitHubRepoSpecs(url);
+    if (!specs.length) return [];
     const cleanPath = String(relPath || "index.html").replace(/^\/+/, "");
-    const combinedPath = [basePath, cleanPath].filter(Boolean).join("/");
-    const encodedPath = combinedPath
-      .split("/")
-      .filter(Boolean)
-      .map((seg) => encodeURIComponent(seg))
-      .join("/");
-    const branches = explicitBranch ? [branch] : ["main", "master"];
-    return branches.map((name) => {
-      const encodedBranch = name
+    const candidates = [];
+    specs.forEach((spec) => {
+      const combinedPath = [spec.basePath, cleanPath]
+        .filter(Boolean)
+        .join("/")
+        .split("/")
+        .map((seg) => {
+          try {
+            return decodeURIComponent(seg);
+          } catch {
+            return seg;
+          }
+        })
+        .join("/");
+      const encodedPath = combinedPath
         .split("/")
         .filter(Boolean)
         .map((seg) => encodeURIComponent(seg))
-        .join("/") || "main";
-      return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodedBranch}/${encodedPath || "index.html"}`;
+        .join("/") || "index.html";
+      const branchList = spec.branch ? [spec.branch] : ["main", "master"];
+      branchList.forEach((name) => {
+        const encodedBranch = name
+          .split("/")
+          .filter(Boolean)
+          .map((seg) => encodeURIComponent(seg))
+          .join("/") || "main";
+        candidates.push(`https://raw.githubusercontent.com/${encodeURIComponent(spec.owner)}/${encodeURIComponent(spec.repo)}/${encodedBranch}/${encodedPath}`);
+        candidates.push(`https://raw.githubusercontent.com/${encodeURIComponent(spec.owner)}/${encodeURIComponent(spec.repo)}/refs/heads/${encodedBranch}/${encodedPath}`);
+        candidates.push(`https://cdn.jsdelivr.net/gh/${encodeURIComponent(spec.owner)}/${encodeURIComponent(spec.repo)}@${encodedBranch}/${encodedPath}`);
+      });
     });
+    return Array.from(new Set(candidates));
   } catch {
     return [];
   }
+}
+
+function parseGitHubRepoSpecs(url) {
+  const parts = url.pathname.split("/").filter(Boolean).map((seg) => {
+    try {
+      return decodeURIComponent(seg);
+    } catch {
+      return seg;
+    }
+  });
+  if (parts.length < 2) return [];
+  const owner = parts[0];
+  const repo = (parts[1] || "").replace(/\.git$/i, "");
+  const mode = parts[2] || "";
+  const remainder = parts.slice(3);
+  if ((mode !== "tree" && mode !== "blob") || remainder.length === 0) {
+    return [{ owner, repo, branch: "", basePath: "" }];
+  }
+
+  const maxBranchDepth = Math.min(4, remainder.length);
+  const specs = [];
+  for (let depth = 1; depth <= maxBranchDepth; depth += 1) {
+    const branch = remainder.slice(0, depth).join("/");
+    const basePath = remainder.slice(depth).join("/");
+    specs.push({ owner, repo, branch, basePath });
+  }
+  return specs;
 }
 
 function guessContentType(path) {
