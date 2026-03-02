@@ -60,6 +60,50 @@ function json(data, status = 200) {
   });
 }
 
+function accessErrorResponse(request, status, title, message, code = "access_error") {
+  const headers = {
+    "cache-control": "no-store",
+    ...corsHeaders(),
+  };
+  if (isDocumentRequest(request)) {
+    return new Response(buildAccessErrorPage(title, message), {
+      status,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        ...headers,
+      },
+    });
+  }
+  return new Response(`${title}: ${message} (${code})`, { status, headers });
+}
+
+function buildAccessErrorPage(title, message) {
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>实验访问失败</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f6f7fb; color: #1f2937; font-family: "Noto Sans SC", sans-serif; }
+    .card { width: min(92vw, 560px); background: #fff; border-radius: 18px; border: 1px solid #e5e7eb; box-shadow: 0 20px 36px rgba(0,0,0,0.08); padding: 24px; }
+    h2 { margin: 0 0 10px 0; color: #b42318; }
+    p { margin: 8px 0; line-height: 1.8; }
+    .hint { color: #6b7280; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>${title}</h2>
+    <p>${message}</p>
+    <p>请注意：本次实验参与失败后，当前实验无法重新报名或重新进入。</p>
+    <p>您仍可返回平台，继续报名其他实验。</p>
+    <p class="hint">如有疑问，请联系主试并提供当前页面截图。</p>
+  </div>
+</body>
+</html>`;
+}
+
 async function getTokenData(env, token) {
   if (!env.ACCESS_KV) return null;
   const raw = await env.ACCESS_KV.get(`access:${token}`);
@@ -302,32 +346,32 @@ async function handleHostedAsset(request, env, url) {
   const accessToken = url.searchParams.get("access_token") || "";
   const tokenData = accessToken ? await getTokenData(env, accessToken) : null;
   if (accessToken && !tokenData) {
-    return new Response("Token not found", { status: 404 });
+    return accessErrorResponse(request, 404, "访问令牌不存在或已失效", "该实验链接已无效。当前实验本次无法重新进入，但您仍可报名并参与其他实验。", "token_not_found");
   }
   if (tokenData && tokenData.mode === "proxy") {
-    return new Response("Invalid mode", { status: 400 });
+    return accessErrorResponse(request, 400, "访问方式错误", "当前访问方式不正确。请从报名成功页面重新进入实验。", "invalid_mode");
   }
 
   if (tokenData && tokenData.mode === "token") {
     const now = Date.now();
     if (tokenData.expires_at_ms && now > tokenData.expires_at_ms) {
-      return new Response("Token expired", { status: 410 });
+      return accessErrorResponse(request, 410, "访问已过期", "该实验访问时间已结束。当前实验本次无法重新报名，但您可以报名其他实验。", "token_expired");
     }
     if (tokenData.access_policy === "unscheduled" && tokenData.grace_expires_at_ms && now > tokenData.grace_expires_at_ms) {
-      return new Response("Grace period expired", { status: 410 });
+      return accessErrorResponse(request, 410, "进入时限已过", "您未在规定时间内进入实验。当前实验本次无法重新进入，但您仍可报名其他实验。", "grace_expired");
     }
     const deviceType = detectDeviceType(request.headers.get("user-agent"));
     if (!isDeviceAllowed(deviceType, tokenData.allowed_devices)) {
-      return new Response("Device not allowed", { status: 403 });
+      return accessErrorResponse(request, 403, "设备不符合要求", "当前设备不在允许范围内，请按要求设备参与。当前实验本次无法重新报名，但可报名其他实验。", "device_not_allowed");
     }
     const startMs = tokenData.start_at_ms || now;
     if (tokenData.access_policy !== "unscheduled" && now < startMs - 2000) {
-      return new Response("Too early", { status: 409 });
+      return accessErrorResponse(request, 409, "实验尚未到开始时间", "请在预约开始时间后再进入。本次链接仍有效，请稍后重试。", "too_early");
     }
     const docRequest = isDocumentRequest(request);
     if (docRequest) {
       if (tokenData.hosted_content_used_at_ms) {
-        return new Response("Token already used", { status: 409 });
+        return accessErrorResponse(request, 409, "该链接已使用", "该实验链接为一次性访问，已被使用。当前实验本次无法重新进入，但您可以报名其他实验。", "token_used");
       }
       const info = getClientInfo(request);
       tokenData.hosted_content_used_at_ms = now;
@@ -337,7 +381,7 @@ async function handleHostedAsset(request, env, url) {
       await saveTokenData(env, accessToken, tokenData);
     }
     if (tokenData.used_at_ms && now > tokenData.used_at_ms + DEFAULT_GRACE_MS) {
-      return new Response("Token expired", { status: 410 });
+      return accessErrorResponse(request, 410, "访问已过期", "实验访问有效期已结束。当前实验本次无法重新进入，但您可以报名其他实验。", "token_expired");
     }
   }
   const accessConfig = tokenData?.access_config || {};
@@ -783,13 +827,13 @@ async function handleDataCollect(request, env) {
 }
 
 async function handleAccessPage(request, env, token) {
-  if (!token) return new Response("Missing token", { status: 400, headers: corsHeaders() });
+  if (!token) return accessErrorResponse(request, 400, "缺少访问令牌", "未检测到访问令牌，请从报名成功页面重新进入。", "missing_token");
   const data = await getTokenData(env, token);
-  if (!data) return new Response("Token not found", { status: 404, headers: corsHeaders() });
+  if (!data) return accessErrorResponse(request, 404, "访问令牌不存在或已失效", "该实验链接已无效。当前实验本次无法重新进入，但您仍可报名其他实验。", "token_not_found");
 
   const now = Date.now();
   if (data.expires_at_ms && now > data.expires_at_ms) {
-    return new Response("Token expired", { status: 410, headers: corsHeaders() });
+    return accessErrorResponse(request, 410, "访问已过期", "实验访问有效期已结束。当前实验本次无法重新进入，但您可以报名其他实验。", "token_expired");
   }
   if (data.access_policy === "unscheduled") {
     if (!data.grace_expires_at_ms || now > data.grace_expires_at_ms) {
@@ -871,27 +915,27 @@ async function handleTokenStatus(request, env, token) {
 }
 
 async function handleProxy(request, env, token, restPath, search) {
-  if (!token) return new Response("Missing token", { status: 400, headers: corsHeaders() });
+  if (!token) return accessErrorResponse(request, 400, "缺少访问令牌", "未检测到访问令牌，请从报名成功页面重新进入。", "missing_token");
   const data = await getTokenData(env, token);
-  if (!data) return new Response("Token not found", { status: 404, headers: corsHeaders() });
-  if (data.mode !== "proxy") return new Response("Invalid mode", { status: 400, headers: corsHeaders() });
+  if (!data) return accessErrorResponse(request, 404, "访问令牌不存在或已失效", "该实验链接已无效。当前实验本次无法重新进入，但您仍可报名其他实验。", "token_not_found");
+  if (data.mode !== "proxy") return accessErrorResponse(request, 400, "访问方式错误", "当前访问方式不正确。请从报名成功页面重新进入实验。", "invalid_mode");
 
   const now = Date.now();
   if (data.expires_at_ms && now > data.expires_at_ms) {
-    return new Response("Token expired", { status: 410, headers: corsHeaders() });
+    return accessErrorResponse(request, 410, "访问已过期", "实验访问有效期已结束。当前实验本次无法重新进入，但您可以报名其他实验。", "token_expired");
   }
   if (data.access_policy === "unscheduled" && data.grace_expires_at_ms && now > data.grace_expires_at_ms) {
-    return new Response("Grace period expired", { status: 410, headers: corsHeaders() });
+    return accessErrorResponse(request, 410, "进入时限已过", "您未在规定时间内进入实验。当前实验本次无法重新进入，但您仍可报名其他实验。", "grace_expired");
   }
 
   const deviceType = detectDeviceType(request.headers.get("user-agent"));
   if (!isDeviceAllowed(deviceType, data.allowed_devices)) {
-    return new Response("Device not allowed", { status: 403, headers: corsHeaders() });
+    return accessErrorResponse(request, 403, "设备不符合要求", "当前设备不在允许范围内，请按要求设备参与。当前实验本次无法重新报名，但可报名其他实验。", "device_not_allowed");
   }
 
   const startMs = data.start_at_ms || now;
   if (data.access_policy !== "unscheduled" && now < startMs) {
-    return new Response("Not started", { status: 409, headers: corsHeaders() });
+    return accessErrorResponse(request, 409, "实验尚未开始", "请在预约开始时间后再进入。本次链接仍有效，请稍后重试。", "not_started");
   }
 
   const existingSessionId = getSessionId(request);
@@ -906,10 +950,10 @@ async function handleProxy(request, env, token, restPath, search) {
   if (data.used_at_ms) {
     const sameClient = isSameClient(data, existingSessionId, request, true);
     if (!sameClient && docRequest) {
-      return new Response("Token already used", { status: 409, headers: corsHeaders() });
+      return accessErrorResponse(request, 409, "该链接已使用", "该实验链接为一次性访问，已被使用。当前实验本次无法重新进入，但您可以报名其他实验。", "token_used");
     }
     if (now > data.used_at_ms + DEFAULT_GRACE_MS) {
-      return new Response("Token expired", { status: 410, headers: corsHeaders() });
+      return accessErrorResponse(request, 410, "访问已过期", "实验访问有效期已结束。当前实验本次无法重新进入，但您可以报名其他实验。", "token_expired");
     }
     if (!existingSessionId && shouldSetSession) {
       data.used_session_id = activeSessionId;
