@@ -283,7 +283,6 @@ function buildWaitingPage(token, data, deviceOk) {
 }
 
 async function handleHostedAsset(request, env, url) {
-  if (!env.ASSETS_R2) return new Response("R2 not configured", { status: 500 });
   const parts = url.pathname.split("/").filter(Boolean);
   const prefix = parts[1];
   if (!prefix) return new Response("Not Found", { status: 404 });
@@ -346,6 +345,53 @@ async function handleHostedAsset(request, env, url) {
     || (accessConfig.allow_download ? "download_and_upload" : "upload_only");
   const allowDownload = downloadPolicy !== "upload_only";
 
+  const prefixSource = await getPrefixSourceConfig(env, prefix);
+  const resolvedSource = accessConfig?.source || prefixSource?.source || "";
+
+  if (resolvedSource === "github") {
+    const githubRepo = accessConfig?.github_repo || prefixSource?.github_repo || "";
+    const targetUrl = buildGitHubRawUrl(githubRepo, relPath);
+    if (!targetUrl) return new Response("Invalid github repo", { status: 400 });
+    const upstream = await fetch(targetUrl, {
+      method: request.method,
+      headers: {
+        "accept": request.headers.get("accept") || "*/*",
+      },
+      redirect: "follow",
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    if (!upstream.ok) {
+      return new Response("Not Found", { status: upstream.status === 404 ? 404 : 502 });
+    }
+    const upstreamType = upstream.headers.get("content-type") || guessContentType(relPath);
+    const isHtml = upstreamType.includes("text/html") || relPath.endsWith(".html");
+    if (!isHtml) {
+      return new Response(upstream.body, {
+        headers: {
+          "content-type": upstreamType || "application/octet-stream",
+          "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+    const html = await upstream.text();
+    const injected = injectCaptureScript(html, {
+      prefix,
+      accessToken,
+      allowDownload,
+      downloadPolicy,
+    });
+    return new Response(injected, {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+
+  if (!env.ASSETS_R2) return new Response("R2 not configured", { status: 500 });
+
   const key = `${prefix}/${relPath}`;
   let object = await env.ASSETS_R2.get(key);
   if (!object && env.PSYCHOJS_R2) {
@@ -374,6 +420,61 @@ async function handleHostedAsset(request, env, url) {
   });
   headers.set("content-type", "text/html; charset=utf-8");
   return new Response(injected, { headers });
+}
+
+async function getPrefixSourceConfig(env, prefix) {
+  if (!env.ASSETS_R2 || !prefix) return null;
+  try {
+    const obj = await env.ASSETS_R2.get(`${prefix}/.source.json`);
+    if (!obj) return null;
+    const text = await obj.text();
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function buildGitHubRawUrl(repoUrl, relPath) {
+  try {
+    const url = new URL(String(repoUrl || ""));
+    if (url.hostname.toLowerCase() !== "github.com") return "";
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return "";
+    const owner = parts[0];
+    const repo = (parts[1] || "").replace(/\.git$/i, "");
+    let branch = "main";
+    if (parts[2] === "tree" && parts[3]) {
+      branch = parts[3];
+    }
+    const cleanPath = String(relPath || "index.html").replace(/^\/+/, "");
+    const encodedPath = cleanPath
+      .split("/")
+      .filter(Boolean)
+      .map((seg) => encodeURIComponent(seg))
+      .join("/");
+    const encodedBranch = branch
+      .split("/")
+      .filter(Boolean)
+      .map((seg) => encodeURIComponent(seg))
+      .join("/") || "main";
+    return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodedBranch}/${encodedPath || "index.html"}`;
+  } catch {
+    return "";
+  }
+}
+
+function guessContentType(path) {
+  const lower = String(path || "").toLowerCase();
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html; charset=utf-8";
+  if (lower.endsWith(".js") || lower.endsWith(".mjs")) return "application/javascript; charset=utf-8";
+  if (lower.endsWith(".css")) return "text/css; charset=utf-8";
+  if (lower.endsWith(".json")) return "application/json; charset=utf-8";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".svg")) return "image/svg+xml";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".woff2")) return "font/woff2";
+  return "application/octet-stream";
 }
 
 function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloadPolicy }) {
