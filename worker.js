@@ -397,6 +397,7 @@ async function handleHostedAsset(request, env, url) {
     const targetUrls = buildGitHubRawCandidates(githubRepo, relPath);
     if (!targetUrls.length) return new Response("Invalid github repo", { status: 400 });
     let upstream = null;
+    let has404 = false;
     for (const targetUrl of targetUrls) {
       const resp = await fetch(targetUrl, {
         method: request.method,
@@ -410,13 +411,41 @@ async function handleHostedAsset(request, env, url) {
         upstream = resp;
         break;
       }
+      if (resp.status === 404) {
+        has404 = true;
+      }
       if (resp.status !== 404) {
         upstream = resp;
         break;
       }
     }
     if (!upstream || !upstream.ok) {
-      const status = upstream?.status === 404 ? 404 : 502;
+      if (env.PSYCHOJS_R2) {
+        const fallbackObj = await env.PSYCHOJS_R2.get(relPath);
+        if (fallbackObj) {
+          const fallbackHeaders = new Headers();
+          fallbackObj.writeHttpMetadata(fallbackHeaders);
+          fallbackHeaders.set("etag", fallbackObj.httpEtag);
+          fallbackHeaders.set("cache-control", "public, max-age=300");
+          fallbackHeaders.set("Access-Control-Allow-Origin", "*");
+          const fallbackType = normalizeAssetContentType(relPath, fallbackHeaders.get("content-type") || "");
+          if (fallbackType) fallbackHeaders.set("content-type", fallbackType);
+          const fallbackIsHtml = fallbackType.includes("text/html") || relPath.endsWith(".html");
+          if (!fallbackIsHtml) {
+            return new Response(fallbackObj.body, { headers: fallbackHeaders });
+          }
+          const fallbackHtml = await fallbackObj.text();
+          const fallbackInjected = injectCaptureScript(fallbackHtml, {
+            prefix,
+            accessToken,
+            allowDownload,
+            downloadPolicy,
+          });
+          fallbackHeaders.set("content-type", "text/html; charset=utf-8");
+          return new Response(fallbackInjected, { headers: fallbackHeaders });
+        }
+      }
+      const status = upstream?.status || (has404 ? 404 : 502);
       return new Response("Not Found", { status });
     }
     const upstreamType = normalizeAssetContentType(relPath, upstream.headers.get("content-type") || guessContentType(relPath));
@@ -495,71 +524,37 @@ function buildGitHubRawCandidates(repoUrl, relPath) {
   try {
     const url = new URL(String(repoUrl || ""));
     if (url.hostname.toLowerCase() !== "github.com") return [];
-    const specs = parseGitHubRepoSpecs(url);
-    if (!specs.length) return [];
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return [];
+    const owner = parts[0];
+    const repo = (parts[1] || "").replace(/\.git$/i, "");
+    let branch = "main";
+    let basePath = "";
+    let explicitBranch = false;
+    if (parts[2] === "tree" && parts[3]) {
+      branch = parts[3];
+      explicitBranch = true;
+      basePath = parts.slice(4).join("/");
+    }
     const cleanPath = String(relPath || "index.html").replace(/^\/+/, "");
-    const candidates = [];
-    specs.forEach((spec) => {
-      const combinedPath = [spec.basePath, cleanPath]
-        .filter(Boolean)
-        .join("/")
-        .split("/")
-        .map((seg) => {
-          try {
-            return decodeURIComponent(seg);
-          } catch {
-            return seg;
-          }
-        })
-        .join("/");
-      const encodedPath = combinedPath
+    const combinedPath = [basePath, cleanPath].filter(Boolean).join("/");
+    const encodedPath = combinedPath
+      .split("/")
+      .filter(Boolean)
+      .map((seg) => encodeURIComponent(seg))
+      .join("/");
+    const branches = explicitBranch ? [branch] : ["main", "master"];
+    return branches.map((name) => {
+      const encodedBranch = name
         .split("/")
         .filter(Boolean)
         .map((seg) => encodeURIComponent(seg))
-        .join("/") || "index.html";
-      const branchList = spec.branch ? [spec.branch] : ["main", "master"];
-      branchList.forEach((name) => {
-        const encodedBranch = name
-          .split("/")
-          .filter(Boolean)
-          .map((seg) => encodeURIComponent(seg))
-          .join("/") || "main";
-        candidates.push(`https://raw.githubusercontent.com/${encodeURIComponent(spec.owner)}/${encodeURIComponent(spec.repo)}/${encodedBranch}/${encodedPath}`);
-        candidates.push(`https://raw.githubusercontent.com/${encodeURIComponent(spec.owner)}/${encodeURIComponent(spec.repo)}/refs/heads/${encodedBranch}/${encodedPath}`);
-        candidates.push(`https://cdn.jsdelivr.net/gh/${encodeURIComponent(spec.owner)}/${encodeURIComponent(spec.repo)}@${encodedBranch}/${encodedPath}`);
-      });
+        .join("/") || "main";
+      return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodedBranch}/${encodedPath || "index.html"}`;
     });
-    return Array.from(new Set(candidates));
   } catch {
     return [];
   }
-}
-
-function parseGitHubRepoSpecs(url) {
-  const parts = url.pathname.split("/").filter(Boolean).map((seg) => {
-    try {
-      return decodeURIComponent(seg);
-    } catch {
-      return seg;
-    }
-  });
-  if (parts.length < 2) return [];
-  const owner = parts[0];
-  const repo = (parts[1] || "").replace(/\.git$/i, "");
-  const mode = parts[2] || "";
-  const remainder = parts.slice(3);
-  if ((mode !== "tree" && mode !== "blob") || remainder.length === 0) {
-    return [{ owner, repo, branch: "", basePath: "" }];
-  }
-
-  const maxBranchDepth = Math.min(4, remainder.length);
-  const specs = [];
-  for (let depth = 1; depth <= maxBranchDepth; depth += 1) {
-    const branch = remainder.slice(0, depth).join("/");
-    const basePath = remainder.slice(depth).join("/");
-    specs.push({ owner, repo, branch, basePath });
-  }
-  return specs;
 }
 
 function guessContentType(path) {
