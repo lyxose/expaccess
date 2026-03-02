@@ -375,7 +375,7 @@ async function handleHostedAsset(request, env, url) {
       const status = upstream?.status === 404 ? 404 : 502;
       return new Response("Not Found", { status });
     }
-    const upstreamType = upstream.headers.get("content-type") || guessContentType(relPath);
+    const upstreamType = normalizeAssetContentType(relPath, upstream.headers.get("content-type") || guessContentType(relPath));
     const isHtml = upstreamType.includes("text/html") || relPath.endsWith(".html");
     if (!isHtml) {
       return new Response(upstream.body, {
@@ -417,7 +417,8 @@ async function handleHostedAsset(request, env, url) {
   headers.set("cache-control", "public, max-age=300");
   headers.set("Access-Control-Allow-Origin", "*");
 
-  const contentType = headers.get("content-type") || "";
+  const contentType = normalizeAssetContentType(relPath, headers.get("content-type") || "");
+  if (contentType) headers.set("content-type", contentType);
   const isHtml = contentType.includes("text/html") || relPath.endsWith(".html");
   if (!isHtml) {
     return new Response(object.body, { headers });
@@ -495,6 +496,18 @@ function guessContentType(path) {
   if (lower.endsWith(".webp")) return "image/webp";
   if (lower.endsWith(".woff2")) return "font/woff2";
   return "application/octet-stream";
+}
+
+function normalizeAssetContentType(path, currentType) {
+  const lower = String(path || "").toLowerCase();
+  const current = String(currentType || "").toLowerCase();
+  const isGeneric = !current || current.startsWith("text/plain") || current === "application/octet-stream";
+  if (!isGeneric) return currentType;
+  if (lower.endsWith(".js") || lower.endsWith(".mjs")) return "application/javascript; charset=utf-8";
+  if (lower.endsWith(".css")) return "text/css; charset=utf-8";
+  if (lower.endsWith(".json")) return "application/json; charset=utf-8";
+  if (lower.endsWith(".csv")) return "text/csv; charset=utf-8";
+  return currentType || guessContentType(path);
 }
 
 function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloadPolicy }) {
