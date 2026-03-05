@@ -1176,13 +1176,13 @@ async function handleTokenVerify(request, env) {
 
   if (data.mode === "token") {
     if (data.hosted_content_used_at_ms) {
-      return json({ error: "Token already used" }, 409);
+      return json({ error: "此链接已经启动过一次实验，无法再次启动" }, 409);
     }
     if (data.access_config?.hosted) {
       return json({ ok: true, start_at_ms: startMs });
     }
     if (data.used_at_ms) {
-      return json({ error: "Token already used" }, 409);
+      return json({ error: "此链接已经启动过一次实验，无法再次启动" }, 409);
     }
     data.used_at_ms = now;
     data.used_at = nowBeijingISOString();
@@ -1192,7 +1192,7 @@ async function handleTokenVerify(request, env) {
 
   if (data.mode === "proxy" && data.used_at_ms) {
     if (!isSameClient(data, sessionId, request, true)) {
-      return json({ error: "Token already used" }, 409);
+      return json({ error: "此链接已经启动过一次实验，无法再次启动" }, 409);
     }
     if (now > data.used_at_ms + DEFAULT_GRACE_MS) {
       return json({ error: "Token expired" }, 410);
