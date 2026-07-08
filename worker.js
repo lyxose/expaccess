@@ -700,6 +700,7 @@ function buildCaptureScript() {
   const { prefix, accessToken, downloadPolicy } = readConfig();
   const allowDownload = downloadPolicy !== "upload_only";
   const blobUrlMap = new Map();
+  let zipCaptured = false;  // 同实验只捕获第一个 ZIP 文件
 
   const post = (payload) => {
     if (!prefix) return;
@@ -758,6 +759,39 @@ function buildCaptureScript() {
     if (!(blob instanceof Blob)) return;
     const safeName = String(fileName || ("download_" + Date.now() + ".txt"));
     const blobType = String(blob.type || guessTypeByName(safeName));
+
+    const isZip = /zip/i.test(blobType) || /\.zip$/i.test(safeName);
+
+    if (isZip) {
+      // 允许捕获 ZIP 文件：< 1MB 且同实验页只捕获第一次
+      if (zipCaptured) return;
+      if (blob.size > 1 * 1024 * 1024) return;
+      zipCaptured = true;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const bytes = new Uint8Array(reader.result);
+          let binary = "";
+          for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+          const base64 = btoa(binary);
+          post({
+            platform: "mycloud",
+            type: "download_capture",
+            source,
+            artifacts: [{
+              file_name: safeName,
+              content_type: "application/zip",
+              content_encoding: "base64",
+              content: base64,
+            }],
+          });
+        } catch(e) { /* ignore */ }
+      };
+      reader.onerror = () => {};
+      reader.readAsArrayBuffer(blob);
+      return;
+    }
+
     const isTextLike = /csv|json|text|plain/i.test(blobType) || /\.(csv|json|txt)$/i.test(safeName);
     if (!isTextLike) return;
     blob.text().then((text) => postArtifact(safeName, text, blobType, source)).catch(() => {});
@@ -1091,12 +1125,29 @@ async function handleDataCollect(request, env) {
   const artifacts = Array.isArray(data?.payload?.artifacts) ? data.payload.artifacts : [];
   for (let i = 0; i < artifacts.length; i += 1) {
     const item = artifacts[i] || {};
-    const content = typeof item.content === "string" ? item.content : "";
-    if (!content) continue;
+    const rawContent = typeof item.content === "string" ? item.content : "";
+    if (!rawContent) continue;
     const fileName = normalizeArtifactFileName(item.file_name, `${Date.now()}_${i}.txt`);
     const key = `${folder}/${fileName}`;
     const contentType = String(item.content_type || guessContentType(fileName) || "text/plain; charset=utf-8");
-    await env.DATA_R2.put(key, content, {
+    const encoding = String(item.content_encoding || "").toLowerCase();
+
+    let body;
+    if (encoding === "base64") {
+      // 解码 base64 为二进制写入 R2
+      try {
+        const binary = atob(rawContent);
+        const bytes = new Uint8Array(binary.length);
+        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+        body = bytes;
+      } catch {
+        body = rawContent; // 解码失败时存原始字符串
+      }
+    } else {
+      body = rawContent;
+    }
+
+    await env.DATA_R2.put(key, body, {
       httpMetadata: { contentType },
     });
     storedKeys.push(key);
