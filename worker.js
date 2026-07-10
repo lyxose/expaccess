@@ -86,6 +86,13 @@ function sanitizeId(value, fallback = "unknown") {
   return safe || fallback;
 }
 
+// 从 prefix（如 exp_E000060_20260707161858）中解析实验编号 E000060；无 token 时用于定位存储目录。
+function prefixToExpUid(prefix) {
+  const text = String(prefix || "");
+  const m = text.match(/(E\d{6})/i);
+  return m ? m[1].toUpperCase() : "";
+}
+
 function escapeCsvCell(value) {
   if (value === null || value === undefined) return "";
   const text = String(value);
@@ -453,11 +460,18 @@ async function handleHostedAsset(request, env, url) {
     }
   }
   const accessConfig = tokenData?.access_config || {};
-  const downloadPolicy = accessConfig.download_policy
-    || (accessConfig.allow_download ? "download_and_upload" : "upload_only");
+  const prefixSource = await getPrefixSourceConfig(env, prefix);
+  // 下载策略解析（保持有 token 行为完全不变）：
+  // 1) 有 token：以 token 级 access_config.download_policy 为准（含 allow_download 兼容）；
+  // 2) 无 token：回退到实验级配置（.source.json 的 download_policy）；
+  // 3) 两者都未显式指定时，默认 "download_and_upload"，确保无 token 的 /exp/ 直链也能正常本地下载。
+  let downloadPolicy = accessConfig.download_policy
+    || (accessConfig.allow_download ? "download_and_upload" : null);
+  if (!downloadPolicy) {
+    downloadPolicy = (prefixSource && prefixSource.download_policy) || "download_and_upload";
+  }
   const allowDownload = downloadPolicy !== "upload_only";
 
-  const prefixSource = await getPrefixSourceConfig(env, prefix);
   const resolvedSource = accessConfig?.source || prefixSource?.source || "";
 
   if (resolvedSource === "github") {
@@ -1119,11 +1133,11 @@ async function handleDataCollect(request, env) {
   }
 
   const experimentUid = sanitizeId(
-    tokenData?.experiment_uid || data?.experiment_uid || data?.payload?.experiment_uid,
+    tokenData?.experiment_uid || data?.experiment_uid || data?.payload?.experiment_uid || prefixToExpUid(prefix),
     "E_UNKNOWN"
   );
   const userUid = sanitizeId(
-    tokenData?.user_uid || data?.user_uid || data?.payload?.user_uid || data?.payload?.data?.participant_id,
+    tokenData?.user_uid || data?.user_uid || data?.payload?.user_uid || data?.payload?.participant_id || data?.payload?.data?.participant_id,
     "U_UNKNOWN"
   );
   const folder = `${experimentUid}/${userUid}`;
