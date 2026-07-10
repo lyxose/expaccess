@@ -93,6 +93,13 @@ function prefixToExpUid(prefix) {
   return m ? m[1].toUpperCase() : "";
 }
 
+// 生成 YYYYMMDDThhmmss 形式的北京时间时间戳，用于无 id（U_UNKNOWN）时隔离每次上传的子文件夹。
+function timestampFolder() {
+  const d = new Date(Date.now() + BEIJING_OFFSET_MS);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}T${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
 function escapeCsvCell(value) {
   if (value === null || value === undefined) return "";
   const text = String(value);
@@ -1140,7 +1147,11 @@ async function handleDataCollect(request, env) {
     tokenData?.user_uid || data?.user_uid || data?.payload?.user_uid || data?.payload?.participant_id || data?.payload?.data?.participant_id,
     "U_UNKNOWN"
   );
-  const folder = `${experimentUid}/${userUid}`;
+  // 无被试 id（U_UNKNOWN）时，用北京时间时间戳子文件夹隔离每次上传，避免不同测试/被试数据混在一起。
+  let folder = `${experimentUid}/${userUid}`;
+  if (userUid === "U_UNKNOWN") {
+    folder = `${folder}/${timestampFolder()}`;
+  }
   const storedKeys = [];
 
   const artifacts = Array.isArray(data?.payload?.artifacts) ? data.payload.artifacts : [];
