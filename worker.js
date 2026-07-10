@@ -705,6 +705,7 @@ function buildCaptureScript() {
   const post = (payload) => {
     if (!prefix) return;
     if (downloadPolicy === "download_only") return;
+    try { console.log('[CAPTURE] post: type=' + (payload && payload.type) + ' visibility=' + document.visibilityState + (document.visibilityState === 'hidden' ? ' [sendBeacon]' : ' [fetch]')); } catch (e) {}
     const body = JSON.stringify({
       prefix,
       access_token: accessToken,
@@ -734,6 +735,7 @@ function buildCaptureScript() {
 
   const postArtifact = (fileName, content, contentType, source) => {
     const text = typeof content === "string" ? content : "";
+    try { console.log('[CAPTURE] postArtifact: file=' + String(fileName) + ' len=' + (text ? text.length : 0) + ' source=' + source); } catch (e) {}
     if (!text) return;
     post({
       platform: "mycloud",
@@ -761,6 +763,7 @@ function buildCaptureScript() {
     const blobType = String(blob.type || guessTypeByName(safeName));
 
     const isZip = /zip/i.test(blobType) || /\.zip$/i.test(safeName);
+    try { console.log('[CAPTURE] captureBlobArtifact ENTER: name=' + safeName + ' size=' + blob.size + ' type=' + blobType + ' isZip=' + isZip); } catch (e) {}
 
     if (isZip) {
       // 允许捕获 ZIP 文件：< 1MB 且同实验页只捕获第一次
@@ -975,8 +978,10 @@ function buildCaptureScript() {
         if (obj instanceof Blob) {
           const url = originalCreateObjectURL(obj);
           blobUrlMap.set(url, obj);
+          try { console.log('[CAPTURE] createObjectURL: blob.size=' + obj.size + ' type=' + type + ' allowDownload=' + allowDownload + ' isTextLike=' + isTextLike); } catch (e) {}
           if (!allowDownload && isTextLike) {
             post({ type: "download_blocked", ts: Date.now(), source: "URL.createObjectURL", blobType: type });
+            try { console.log('[CAPTURE] createObjectURL: BLOCKED -> posted download_blocked, returning FAKE url; this blob will NOT be captured via anchor.click'); } catch (e) {}
             return "about:blank#blocked-download";
           }
           return url;
@@ -1025,8 +1030,10 @@ function buildCaptureScript() {
         const hasDownload = this.hasAttribute("download");
         const isBlob = href.startsWith("blob:");
         const isData = href.startsWith("data:");
+        try { console.log('[CAPTURE] anchor.click: href=' + href.slice(0, 48) + ' hasDownload=' + hasDownload + ' isBlob=' + isBlob + ' isData=' + isData + ' allowDownload=' + allowDownload); } catch (e) {}
         if (hasDownload || isBlob || isData) {
           if (isBlob && blobUrlMap.has(href)) {
+            try { console.log('[CAPTURE] anchor.click: CAPTURING blob via captureBlobArtifact'); } catch (e) {}
             captureBlobArtifact(blobUrlMap.get(href), fileName, "anchor.click");
           }
           if (isData) {
