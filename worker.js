@@ -86,6 +86,45 @@ function sanitizeId(value, fallback = "unknown") {
   return safe || fallback;
 }
 
+function sanitizeTable(name) {
+  const t = String(name || "").trim();
+  if (/^[A-Za-z0-9_]+$/.test(t)) return t;
+  return "";
+}
+
+// 在“进入实验 / 数据上传”事件时，把实际时间原子写入 participants_json（按 user_uid 定位）。
+// 使用单条 UPDATE + json_group_array + json_each 过滤，不依赖 read-modify-write，
+// 避免并发覆盖其它字段；失败仅记录日志，不影响主流程（上传/R2 写入已成功）。
+async function recordParticipantTime(env, { experimentUid, userUid, fields }) {
+  if (!env.DB || !experimentUid || !userUid) return;
+  const keys = Object.keys(fields || {});
+  if (!keys.length) return;
+  try {
+    const exp = await env.DB.prepare("SELECT table_name FROM experiments WHERE experiment_uid = ?")
+      .bind(experimentUid)
+      .first();
+    const tbl = sanitizeTable(exp && exp.table_name);
+    if (!tbl) return;
+    let expr = "value";
+    for (let i = 0; i < keys.length; i += 1) {
+      expr = `json_set(${expr}, '$.${keys[i]}', ?)`;
+    }
+    const sql = `UPDATE ${tbl} SET participants_json = (
+      SELECT json_group_array(
+        CASE WHEN json_extract(value, '$.user_uid') = ? THEN ${expr} ELSE value END
+      )
+      FROM json_each(participants_json)
+    ) WHERE id IN (
+      SELECT s.id FROM ${tbl} s, json_each(s.participants_json) j
+      WHERE json_extract(j.value, '$.user_uid') = ?
+    )`;
+    const binds = [...keys.map((k) => fields[k]), userUid, userUid];
+    await env.DB.prepare(sql).bind(...binds).run();
+  } catch (e) {
+    console.error("recordParticipantTime failed:", e);
+  }
+}
+
 // 从 prefix（如 exp_E000060_20260707161858）中解析实验编号 E000060；无 token 时用于定位存储目录。
 function prefixToExpUid(prefix) {
   const text = String(prefix || "");
@@ -461,6 +500,11 @@ async function handleHostedAsset(request, env, url) {
       tokenData.hosted_used_ip = info.ip;
       tokenData.hosted_used_ua = info.ua;
       await saveTokenData(env, accessToken, tokenData);
+      await recordParticipantTime(env, {
+        experimentUid: tokenData.experiment_uid,
+        userUid: tokenData.user_uid,
+        fields: { actual_opened_at: nowBeijingISOString(), participation_source: "token_used_at" },
+      });
     }
     if (tokenData.used_at_ms && now > tokenData.used_at_ms + DEFAULT_GRACE_MS) {
       return accessErrorResponse(request, 410, "访问已过期", "实验访问有效期已结束。当前实验本次无法重新进入，但您可以报名其他实验。", "token_expired");
@@ -677,7 +721,7 @@ function injectCaptureScript(html, { prefix, accessToken, allowDownload, downloa
     prefix: String(prefix || ""),
     token: String(accessToken || ""),
     policy: String(downloadPolicy || "upload_only"),
-    v: "20260302-4",
+    v: "20260715-1",
   });
   const scriptTag = `<script src="/exp/${encodeURIComponent(prefix)}/_capture.js?${params.toString()}"></script>`;
   if (html.includes("</head>")) {
@@ -723,6 +767,33 @@ function buildCaptureScript() {
   const blobUrlMap = new Map();
   let zipCaptured = false;  // 同实验只捕获第一个 ZIP 文件
 
+  // 在途上传计数 + 底部提示条，用于告知用户“数据保存中/已完成”，并在未保存完时阻止提前关闭
+  let pendingUploads = 0;
+  let uploadToast = null;
+  let uploadToastTimer = null;
+  const showUploadToast = (text, done) => {
+    try {
+      if (!uploadToast) {
+        uploadToast = document.createElement("div");
+        uploadToast.style.cssText = "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;background:rgba(17,24,39,0.92);color:#fff;padding:10px 16px;border-radius:10px;font:14px/1.5 system-ui,'Microsoft YaHei',sans-serif;box-shadow:0 8px 24px rgba(0,0,0,0.25);transition:opacity .2s;max-width:80vw;";
+        document.body.appendChild(uploadToast);
+      }
+      uploadToast.textContent = text;
+      uploadToast.style.opacity = "1";
+      if (done) {
+        clearTimeout(uploadToastTimer);
+        uploadToastTimer = setTimeout(function () { if (uploadToast) uploadToast.style.opacity = "0"; }, 2600);
+      }
+    } catch (e) {}
+  };
+  const markUploadSettled = () => {
+    pendingUploads -= 1;
+    if (pendingUploads <= 0) {
+      pendingUploads = 0;
+      showUploadToast("数据已保存，可安全关闭页面 ✓", true);
+    }
+  };
+
   const post = (payload) => {
     if (!prefix) return;
     if (downloadPolicy === "download_only") return;
@@ -733,9 +804,13 @@ function buildCaptureScript() {
       download_policy: downloadPolicy,
       payload,
     });
+    pendingUploads += 1;
+    showUploadToast("正在保存实验数据，请勿关闭页面…");
+    const settle = () => { markUploadSettled(); };
     if (document.visibilityState === "hidden" && navigator.sendBeacon) {
       const blob = new Blob([body], { type: "application/json" });
       navigator.sendBeacon("/data/collect", blob);
+      settle();
       return;
     }
     fetch("/data/collect", {
@@ -743,7 +818,7 @@ function buildCaptureScript() {
       headers: { "Content-Type": "application/json" },
       body,
       keepalive: true,
-    }).catch(() => {});
+    }).then(settle).catch(settle);
   };
 
   const guessTypeByName = (name) => {
@@ -1098,6 +1173,13 @@ function buildCaptureScript() {
     if (document.visibilityState === "hidden") extractPsychoData();
   });
   window.addEventListener("beforeunload", extractPsychoData);
+  window.addEventListener("beforeunload", (e) => {
+    if (pendingUploads > 0) {
+      e.preventDefault();
+      e.returnValue = "实验数据仍在保存中，关闭页面可能导致数据丢失，确定要离开吗？";
+      return e.returnValue;
+    }
+  });
 
   const hookTimer = setInterval(() => {
     if (hookPsychoSave()) {
@@ -1201,6 +1283,14 @@ async function handleDataCollect(request, env) {
     return json({ error: "No artifact content to store" }, 400);
   }
 
+  if (userUid && userUid !== "U_UNKNOWN") {
+    await recordParticipantTime(env, {
+      experimentUid,
+      userUid,
+      fields: { actual_ended_at: nowBeijingISOString() },
+    });
+  }
+
   return json({ ok: true, key: storedKeys[0], stored_keys: storedKeys, experiment_uid: experimentUid, user_uid: userUid });
 }
 
@@ -1270,6 +1360,11 @@ async function handleTokenVerify(request, env) {
     data.used_at_ms = now;
     data.used_at = nowBeijingISOString();
     await saveTokenData(env, token, data);
+    await recordParticipantTime(env, {
+      experimentUid: data.experiment_uid,
+      userUid: data.user_uid,
+      fields: { actual_opened_at: nowBeijingISOString(), participation_source: "token_used_at" },
+    });
     return json({ ok: true, start_at_ms: startMs });
   }
 
@@ -1345,6 +1440,11 @@ async function handleProxy(request, env, token, restPath, search) {
     data.used_ip = info.ip;
     data.used_ua = info.ua;
     await saveTokenData(env, token, data);
+    await recordParticipantTime(env, {
+      experimentUid: data.experiment_uid,
+      userUid: data.user_uid,
+      fields: { actual_opened_at: nowBeijingISOString(), participation_source: "token_used_at" },
+    });
   }
 
   const targetBase = new URL(data.target_url);

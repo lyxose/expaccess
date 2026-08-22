@@ -18,3 +18,10 @@ bucket_name = "exp-psychojs-lib"
 [[r2_buckets]]
 binding = "DATA_R2"
 bucket_name = "exp-data"
+
+# 复用 subjinfo 的同一个 D1 库，便于在“进入实验 / 数据上传”事件时把实际时间原子写入 participants_json，
+# 避免管理端每次刷新名单都去扫描 R2 / KV。
+[[d1_databases]]
+binding = "DB"
+database_name = "subjinfo"
+database_id = "bee3d243-a97c-4f17-97fe-de72de1a7d53"
