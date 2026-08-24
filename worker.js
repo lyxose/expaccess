@@ -1304,7 +1304,8 @@ async function handleAccessPage(request, env, token) {
     return accessErrorResponse(request, 410, "访问已过期", "实验访问有效期已结束。当前实验本次无法重新进入，但您可以报名其他实验。", "token_expired");
   }
   if (data.access_policy === "unscheduled") {
-    if (!data.grace_expires_at_ms || now > data.grace_expires_at_ms) {
+    // 仅在首次缺失时补 grace_expires_at_ms，过期后不再重设，避免刷新页面重置倒计时、绕过进入时限。
+    if (!data.grace_expires_at_ms) {
       data.grace_expires_at_ms = now + UNSCHEDULED_GRACE_MS;
       await saveTokenData(env, token, data);
     }
