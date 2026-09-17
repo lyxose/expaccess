@@ -512,6 +512,9 @@ async function handleHostedAsset(request, env, url) {
   }
   const accessConfig = tokenData?.access_config || {};
   const prefixSource = await getPrefixSourceConfig(env, prefix);
+  // 资源目录重定向：当文件过多未做搬运时，正式目录仅存放指针，
+  // .source.json 中的 asset_prefix 指向真实资源目录，据此取文件。
+  const assetPrefix = String(prefixSource?.asset_prefix || "").trim() || prefix;
   // 下载策略解析（保持有 token 行为完全不变）：
   // 1) 有 token：以 token 级 access_config.download_policy 为准（含 allow_download 兼容）；
   // 2) 无 token：回退到实验级配置（.source.json 的 download_policy）；
@@ -610,7 +613,7 @@ async function handleHostedAsset(request, env, url) {
 
   if (!env.ASSETS_R2) return new Response("R2 not configured", { status: 500 });
 
-  const key = `${prefix}/${relPath}`;
+  const key = `${assetPrefix}/${relPath}`;
   let object = await env.ASSETS_R2.get(key);
   if (!object && env.PSYCHOJS_R2) {
     object = await env.PSYCHOJS_R2.get(relPath);
